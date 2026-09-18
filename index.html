@@ -16,14 +16,19 @@
 
 <!-- ============ CONTROL CENTRE (no ?game= in URL) ============ -->
 <div class="wrap" id="control-centre" style="display:none;">
-  <header class="top">
-    <div class="wordmark"><span class="ba1">BRITISH</span> <span class="ba2">AIRWAYS</span></div>
-    <div class="eyebrow">Control Centre</div>
-    <h1>The London <span class="accent">Run</span></h1>
-    <div class="subtitle">Create, open and manage every game from one place — each one keeps its own teams, board and results.</div>
+  <header class="topnav">
+    <div class="topnav-left">
+      <div class="topnav-word">The London Run</div>
+      <div class="topnav-sub">Control Centre</div>
+    </div>
+    <div class="topnav-right">
+      <span class="live-dot" title="Live data"></span>
+      <span class="topnav-badge" style="background:var(--ba-blue-corp);">HQ</span>
+    </div>
   </header>
 
   <div style="padding:18px 20px;">
+    <div class="status-line" style="margin-bottom:12px; font-size:12px;">Create, open and manage every game from one place — each one keeps its own teams, board and results.</div>
     <div class="card" id="cc-gate-card">
       <h2>Organiser access</h2>
       <label class="field-label">Control centre passcode</label>
@@ -33,53 +38,77 @@
     </div>
 
     <div id="cc-panel" style="display:none;">
-      <div class="card">
-        <h2>Create a new game</h2>
-        <label class="field-label">Game name</label>
-        <input type="text" id="cc-new-name" placeholder="e.g. September Away Day">
-        <label class="field-label">Location template</label>
-        <select id="cc-new-template"><option value="monopoly-builtin">Monopoly (built-in — 26 London streets)</option></select>
-        <div class="btn-row"><button class="btn" id="cc-create-btn">Create game</button></div>
-        <div class="status-line" id="cc-create-status"></div>
+      <div class="status-line" id="cc-stats-line" style="margin-bottom:12px; font-size:12px;"></div>
+      <div class="sort-row" id="cc-subnav">
+        <button data-cc-tab="games" class="active">Games</button>
+        <button data-cc-tab="groups">Groups</button>
+        <button data-cc-tab="templates">Templates</button>
+        <button data-cc-tab="settings">Settings</button>
       </div>
 
-      <div class="card">
-        <h2>Games</h2>
-        <label style="display:flex; align-items:center; gap:6px; font-size:11px; color:var(--ba-warm-grey); font-weight:700; margin-bottom:8px;">
-          <input type="checkbox" id="cc-show-archived" style="width:auto;"> Show archived games
-        </label>
-        <div id="cc-games-list"></div>
-        <div class="btn-row"><button class="btn secondary" id="cc-refresh-btn">Refresh</button></div>
+      <div class="admin-subpanel" data-cc-panel="games">
+        <div class="card">
+          <h2>Create a new game</h2>
+          <label class="field-label">Game name</label>
+          <input type="text" id="cc-new-name" placeholder="e.g. September Away Day">
+          <label class="field-label">Location template</label>
+          <select id="cc-new-template"><option value="monopoly-builtin">Monopoly (built-in — 26 London streets)</option><option value="blank-custom">Blank — add my own locations</option></select>
+          <div class="small-note">Pick "Blank" to start with an empty board — add locations afterwards from that game's Admin &gt; Game setup tab.</div>
+          <div class="btn-row"><button class="btn" id="cc-create-btn">Create game</button></div>
+          <div class="status-line" id="cc-create-status"></div>
+        </div>
+
+        <div class="card">
+          <h2>Games</h2>
+          <label style="display:flex; align-items:center; gap:6px; font-size:11px; color:var(--ba-warm-grey); font-weight:700; margin-bottom:8px;">
+            <input type="checkbox" id="cc-show-archived" style="width:auto;"> Show archived games
+          </label>
+          <div id="cc-games-list"></div>
+          <div class="btn-row"><button class="btn secondary" id="cc-refresh-btn">Refresh</button></div>
+        </div>
       </div>
 
-      <div class="card">
-        <h2>Location templates</h2>
-        <div class="status-line">Templates are reusable location sets you can pick from when creating a game. Build one from scratch by importing a CSV, or start from a copy of Monopoly and tweak it.</div>
-        <label class="field-label">Template name</label>
-        <input type="text" id="tpl-new-name" placeholder="e.g. Office Crawl">
-        <label class="field-label">Start from</label>
-        <select id="tpl-source">
-          <option value="blank">Blank — build entirely from CSV below</option>
-          <option value="monopoly">Copy of Monopoly (built-in)</option>
-        </select>
-        <label class="field-label">Import CSV file (optional)</label>
-        <input type="file" accept=".csv,text/csv" id="tpl-csv-file">
-        <label class="field-label">CSV contents — columns: name, group, color, price, lat, lng, type, fact, note</label>
-        <textarea id="tpl-csv-input" placeholder="name,group,color,price,lat,lng,type,fact,note&#10;Reception Desk,Ground Floor,#2E5C99,100,51.4700,-0.4543,street,,&#10;Prize Draw,Special,#CE210F,0,51.4701,-0.4540,special,,Pull a card here"></textarea>
-        <div class="small-note">type is one of: street, station, or special (special = a Chance/Community-Chest-style draw point, no price needed). Leave price/group blank for special rows.</div>
-        <div class="btn-row"><button class="btn" id="tpl-create-btn">Create template</button></div>
-        <div class="status-line" id="tpl-create-status"></div>
-        <div class="ba-divider"></div>
-        <div id="tpl-list"></div>
-        <div class="btn-row"><button class="btn secondary" id="tpl-refresh-btn">Refresh templates</button></div>
+      <div class="admin-subpanel" data-cc-panel="groups" style="display:none;">
+        <div class="card full-width">
+          <h2>Groups</h2>
+          <div class="status-line">Group games together to run them as one combined event — a shared leaderboard across every team, plus start/reset/finalise for the whole group at once. Useful when there are too many teams for one board.</div>
+          <label class="field-label">Group name</label>
+          <input type="text" id="grp-new-name" placeholder="e.g. Morning Heat">
+          <div class="btn-row"><button class="btn" id="grp-create-btn">Create group</button></div>
+          <div class="status-line" id="grp-create-status"></div>
+          <div class="ba-divider"></div>
+          <div id="grp-list"></div>
+          <div class="btn-row"><button class="btn secondary" id="grp-refresh-btn">Refresh groups</button></div>
+        </div>
       </div>
 
-      <div class="card">
-        <h2>Control centre passcode</h2>
-        <label class="field-label">Change passcode</label>
-        <input type="text" id="cc-passcode-input">
-        <div class="btn-row"><button class="btn secondary" id="cc-passcode-save-btn">Save passcode</button></div>
-        <div class="status-line" id="cc-passcode-status"></div>
+      <div class="admin-subpanel" data-cc-panel="templates" style="display:none;">
+        <div class="card full-width">
+          <h2>Location templates</h2>
+          <div class="status-line">Name it, create it, then add its locations — by CSV import, picking on a map, or typing them in one by one.</div>
+          <label class="field-label">Template name</label>
+          <input type="text" id="tpl-new-name" placeholder="e.g. Office Crawl">
+          <label class="field-label">Start from</label>
+          <select id="tpl-source">
+            <option value="blank">Blank — add locations after creating</option>
+            <option value="monopoly">Copy of Monopoly (built-in)</option>
+          </select>
+          <div class="btn-row"><button class="btn" id="tpl-create-btn">Create &amp; edit locations</button></div>
+          <div class="status-line" id="tpl-create-status"></div>
+          <div class="ba-divider"></div>
+          <div id="tpl-list"></div>
+          <div class="btn-row"><button class="btn secondary" id="tpl-refresh-btn">Refresh templates</button></div>
+        </div>
+      </div>
+
+      <div class="admin-subpanel" data-cc-panel="settings" style="display:none;">
+        <div class="card">
+          <h2>Control centre passcode</h2>
+          <label class="field-label">Change passcode</label>
+          <input type="text" id="cc-passcode-input">
+          <div class="btn-row"><button class="btn secondary" id="cc-passcode-save-btn">Save passcode</button></div>
+          <div class="status-line" id="cc-passcode-status"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -205,6 +234,11 @@
       <div id="own-activity-list"></div>
     </div>
 
+    <div class="card" id="challenges-card" style="display:none;">
+      <h2>Challenges</h2>
+      <div id="team-challenges-list"></div>
+    </div>
+
     <div class="card">
       <h2>Your map</h2>
       <div id="player-map"></div>
@@ -231,6 +265,7 @@
 
   <!-- LEADERBOARD VIEW -->
   <section class="view" id="view-leaderboard">
+    <div id="podium-section" style="display:none;"></div>
     <div class="card"><h2>Live standings</h2><div class="status-line">Net worth = cash + value of owned properties.</div></div>
     <div id="leaderboard-list"></div>
     <div class="btn-row"><button class="btn secondary" id="lb-refresh-btn">Refresh</button></div>
@@ -239,180 +274,316 @@
 
   <!-- ADMIN VIEW -->
   <section class="view" id="view-admin">
+    <div class="sort-row" id="admin-subnav">
+      <button data-admin-tab="teams" class="active">Teams</button>
+      <button data-admin-tab="play">Play control</button>
+      <button data-admin-tab="setup">Game setup</button>
+      <button data-admin-tab="log">Action log</button>
+    </div>
+
     <div id="admin-panel">
-      <div class="card">
-        <h2>Event settings</h2>
-        <label class="field-label">Starting money per team (£)</label>
-        <input type="number" id="cfg-startmoney">
-        <label class="field-label">Check-in radius (metres)</label>
-        <input type="number" id="cfg-radius">
-        <label class="field-label">Event end time</label>
-        <input type="datetime-local" id="cfg-end">
-        <label class="field-label">Organiser passcode</label>
-        <input type="text" id="cfg-passcode">
-        <label class="field-label">Starting location (lat, lng)</label>
-        <div style="display:flex; gap:8px;">
-          <input type="number" step="0.00001" id="cfg-start-lat" style="flex:1;">
-          <input type="number" step="0.00001" id="cfg-start-lng" style="flex:1;">
-        </div>
-        <div class="btn-row"><button class="btn secondary" id="cfg-start-locate-btn">Use my location</button></div>
-        <div class="btn-row"><button class="btn" id="cfg-save-btn">Save settings</button></div>
-        <div class="status-line" id="cfg-status"></div>
-        <div class="status-line" id="game-identity-note" style="margin-top:14px; padding-top:10px; border-top:1px solid var(--grey1);">This game's data is fully separate from every other game. Want a rehearsal? Create a new game from the Control Centre instead of testing inside this one.</div>
-      </div>
-
-      <div class="card">
-        <h2>Register a team</h2>
-        <label class="field-label">Team name</label>
-        <input type="text" id="new-team-name" placeholder="e.g. The Fenchurch Foxes">
-        <label class="field-label">Team icon</label>
-        <select id="new-team-icon"></select>
-        <label class="field-label">Team PIN</label>
-        <input type="text" id="new-team-pin" placeholder="Leave blank to auto-generate">
-        <label class="field-label">Players (comma separated)</label>
-        <textarea id="new-team-players" placeholder="Alex, Sam, Jo, Priya, Tom, Chidi"></textarea>
-        <label class="field-label">Emergency contact name</label>
-        <input type="text" id="new-team-ec-name" placeholder="Contact name">
-        <label class="field-label">Emergency contact phone</label>
-        <input type="text" id="new-team-ec-phone" placeholder="e.g. 07700 900123">
-        <div class="btn-row"><button class="btn" id="new-team-btn">Add team</button></div>
-        <div class="status-line" id="new-team-status"></div>
-      </div>
-
-      <div class="card full-width">
-        <h2>Manage teams</h2>
-        <label class="field-label">Select team</label>
-        <select id="manage-team-select"><option value="">— choose team —</option></select>
-        <div id="manage-team-fields" style="display:none;">
+      <div class="admin-subpanel" data-admin-panel="teams">
+        <div class="card">
+          <h2>Register a team</h2>
+          <label class="field-label">Team name</label>
+          <input type="text" id="new-team-name" placeholder="e.g. The Fenchurch Foxes">
           <label class="field-label">Team icon</label>
-          <select id="edit-team-icon"></select>
+          <select id="new-team-icon"></select>
           <label class="field-label">Team PIN</label>
-          <input type="text" id="edit-team-pin">
+          <input type="text" id="new-team-pin" placeholder="Leave blank to auto-generate">
           <label class="field-label">Players (comma separated)</label>
-          <textarea id="edit-team-players"></textarea>
+          <textarea id="new-team-players" placeholder="Alex, Sam, Jo, Priya, Tom, Chidi"></textarea>
           <label class="field-label">Emergency contact name</label>
-          <input type="text" id="edit-team-ec-name">
+          <input type="text" id="new-team-ec-name" placeholder="Contact name">
           <label class="field-label">Emergency contact phone</label>
-          <input type="text" id="edit-team-ec-phone">
-          <label class="field-label">Cash balance (£)</label>
-          <input type="number" id="edit-team-cash">
-          <div class="btn-row">
-            <button class="btn" id="edit-team-save-btn">Save changes</button>
-            <button class="btn secondary" id="edit-team-unlock-btn">Unlock device</button>
-          </div>
-          <div class="btn-row">
-            <button class="btn danger" id="edit-team-reset-btn">Reset this team's progress</button>
-          </div>
-          <div class="status-line" id="edit-team-status"></div>
+          <input type="text" id="new-team-ec-phone" placeholder="e.g. 07700 900123">
+          <div class="btn-row"><button class="btn" id="new-team-btn">Add team</button></div>
+          <div class="status-line" id="new-team-status"></div>
         </div>
-      </div>
 
-      <div class="card full-width">
-        <h2>Chance &amp; Community Chest cards</h2>
-        <div class="status-line">These cards are specific to this game — edit freely without affecting any other game.</div>
-        <div id="cards-manager-list" style="margin-top:8px;"></div>
-        <div class="ba-divider"></div>
-        <label class="field-label">New card text</label>
-        <input type="text" id="new-card-text" placeholder="e.g. Found a £20 note on the pavement">
-        <label class="field-label">Effect</label>
-        <select id="new-card-effect-type">
-          <option value="cash">Cash amount</option>
-          <option value="flag">Bonus card (fine immunity / rent boost)</option>
-          <option value="auction">Trigger a property auction</option>
-        </select>
-        <input type="number" id="new-card-cash" placeholder="e.g. 200 or -150">
-        <select id="new-card-flag" style="display:none;">
-          <option value="fineImmunity">Fine Immunity</option>
-          <option value="rentBoost">Rent Boost</option>
-        </select>
-        <div class="btn-row"><button class="btn" id="add-card-btn">Add card</button></div>
-        <div class="status-line" id="add-card-status"></div>
-      </div>
-
-      <div class="card full-width" id="team-links-card">
-        <h2>Team links</h2>
-        <div class="status-line">Each team gets its own link below — opening it signs that team straight into Play, no name or PIN needed. Send each team only their own link.</div>
-        <div id="team-links-list" style="margin-top:10px;"></div>
-        <div class="btn-row"><button class="btn secondary" id="team-links-refresh-btn">Refresh</button></div>
-      </div>
-
-      <div class="card full-width">
-        <h2>Locations map</h2>
-        <div class="status-line">Drag a pin to correct its spot, or select one and type exact coordinates. Changes apply instantly everywhere — check-ins, compass, board.</div>
-        <div id="leaflet-map" style="margin-top:10px;"></div>
-        <div class="btn-row">
-          <button class="btn secondary" id="loc-locate-btn">Show my location on map</button>
-          <button class="btn secondary" id="loc-reset-all-btn">Reset all to defaults</button>
-        </div>
-        <div id="loc-edit-panel" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid var(--grey1);">
-          <div class="status-line" id="loc-edit-name" style="font-weight:800; color:var(--navy); font-size:13px;"></div>
-          <label class="field-label">Latitude</label>
-          <input type="number" step="0.00001" id="loc-edit-lat">
-          <label class="field-label">Longitude</label>
-          <input type="number" step="0.00001" id="loc-edit-lng">
-          <div class="btn-row">
-            <button class="btn" id="loc-save-btn">Save coordinates</button>
-            <button class="btn secondary" id="loc-reset-btn">Reset this pin</button>
+        <div class="card full-width">
+          <h2>Manage teams</h2>
+          <label class="field-label">Select team</label>
+          <select id="manage-team-select"><option value="">— choose team —</option></select>
+          <div id="manage-team-fields" style="display:none;">
+            <label class="field-label">Team icon</label>
+            <select id="edit-team-icon"></select>
+            <label class="field-label">Team PIN</label>
+            <input type="text" id="edit-team-pin">
+            <label class="field-label">Players (comma separated)</label>
+            <textarea id="edit-team-players"></textarea>
+            <label class="field-label">Emergency contact name</label>
+            <input type="text" id="edit-team-ec-name">
+            <label class="field-label">Emergency contact phone</label>
+            <input type="text" id="edit-team-ec-phone">
+            <label class="field-label">Cash balance (£)</label>
+            <input type="number" id="edit-team-cash">
+            <div class="btn-row">
+              <button class="btn" id="edit-team-save-btn">Save changes</button>
+              <button class="btn secondary" id="edit-team-unlock-btn">Unlock device</button>
+            </div>
+            <div class="btn-row">
+              <button class="btn danger" id="edit-team-reset-btn">Reset this team's progress</button>
+            </div>
+            <div class="status-line" id="edit-team-status"></div>
           </div>
         </div>
-      </div>
 
-      <div class="card full-width">
-        <h2>Live tracking (safety)</h2>
-        <div class="status-line">Positions update automatically from each team's phone. See them live as pins on the Locations map above — refreshes every 15s while this tab is open.</div>
-        <div id="tracking-list" style="margin-top:10px;"></div>
-        <div class="btn-row"><button class="btn secondary" id="tracking-refresh-btn">Refresh</button></div>
-      </div>
-
-      <div class="card">
-        <h2>Finalise event</h2>
-        <div class="status-line">Applies the 1.5× rent fine to every team for any unvisited property, then locks the board.</div>
-        <div class="btn-row">
-          <button class="btn danger" id="finalize-btn">Finalise &amp; apply fines</button>
-          <button class="btn secondary" id="unlock-board-btn">Re-open board</button>
+        <div class="card full-width" id="team-links-card">
+          <h2>Team links</h2>
+          <div class="status-line">Each team gets its own link below — opening it signs that team straight into Play, no name or PIN needed. Send each team only their own link.</div>
+          <div id="team-links-list" style="margin-top:10px;"></div>
+          <div class="btn-row"><button class="btn secondary" id="team-links-refresh-btn">Refresh</button></div>
         </div>
-        <div class="status-line" id="finalize-status"></div>
-      </div>
 
-      <div class="card">
-        <h2>Snapshots</h2>
-        <div class="status-line">Best-effort — saves automatically about once an hour while an organiser keeps this tab open, or save on demand.</div>
-        <div class="btn-row"><button class="btn secondary" id="snapshot-btn">Save snapshot now</button></div>
-        <div class="status-line" id="snapshot-status"></div>
-      </div>
-
-      <div class="card full-width">
-        <h2>Halfway meetup challenge</h2>
-        <div class="status-line">Set a meetup point and deadline. Any team whose GPS isn't within range by the deadline starts accruing a fine automatically, every 5 minutes, until they arrive.</div>
-        <label class="field-label">Meetup point (lat, lng)</label>
-        <div style="display:flex; gap:8px;">
-          <input type="number" step="0.00001" id="meetup-lat" style="flex:1;">
-          <input type="number" step="0.00001" id="meetup-lng" style="flex:1;">
+        <div class="card full-width">
+          <h2>Live tracking (safety)</h2>
+          <div class="status-line">Positions update automatically from each team's phone. See them live as pins on the Locations map in Game Setup — refreshes every 15s while this tab is open.</div>
+          <div id="tracking-list" style="margin-top:10px;"></div>
+          <div class="btn-row"><button class="btn secondary" id="tracking-refresh-btn">Refresh</button></div>
         </div>
-        <div class="btn-row"><button class="btn secondary" id="meetup-locate-btn">Use my location</button></div>
-        <label class="field-label">Deadline</label>
-        <input type="datetime-local" id="meetup-deadline">
-        <label class="field-label">Fine per 5 minutes late (£)</label>
-        <input type="number" id="meetup-fine" value="50">
-        <label class="field-label">Arrival radius (metres)</label>
-        <input type="number" id="meetup-radius" value="150">
-        <div class="btn-row">
-          <button class="btn" id="meetup-start-btn">Start challenge</button>
-          <button class="btn secondary" id="meetup-cancel-btn">Cancel challenge</button>
-        </div>
-        <div class="status-line" id="meetup-status"></div>
       </div>
 
-      <div class="card">
-        <h2>Reset</h2>
-        <div class="status-line">Wipes all teams, ownership and tracking data. Settings are kept.</div>
-        <div class="btn-row"><button class="btn danger" id="admin-reset-btn">Reset all teams</button></div>
+      <div class="admin-subpanel" data-admin-panel="play" style="display:none;">
+        <div class="card">
+          <h2>Event settings</h2>
+          <label class="field-label">Starting money per team (£)</label>
+          <input type="number" id="cfg-startmoney">
+          <label class="field-label">Check-in radius (metres)</label>
+          <input type="number" id="cfg-radius">
+          <label class="field-label">Event end time</label>
+          <input type="datetime-local" id="cfg-end">
+          <label class="field-label">Organiser passcode</label>
+          <input type="text" id="cfg-passcode">
+          <label class="field-label">Starting location (lat, lng)</label>
+          <div style="display:flex; gap:8px;">
+            <input type="number" step="0.00001" id="cfg-start-lat" style="flex:1;">
+            <input type="number" step="0.00001" id="cfg-start-lng" style="flex:1;">
+          </div>
+          <div class="btn-row"><button class="btn secondary" id="cfg-start-locate-btn">Use my location</button></div>
+          <div class="btn-row"><button class="btn" id="cfg-save-btn">Save settings</button></div>
+          <div class="status-line" id="cfg-status"></div>
+          <div class="status-line" id="game-identity-note" style="margin-top:14px; padding-top:10px; border-top:1px solid var(--grey1);">This game's data is fully separate from every other game. Want a rehearsal? Create a new game from the Control Centre instead of testing inside this one.</div>
+        </div>
+
+        <div class="card">
+          <h2>Finalise event</h2>
+          <div class="status-line">Applies the 1.5× rent fine to every team for any unvisited property, then locks the board.</div>
+          <div class="btn-row">
+            <button class="btn danger" id="finalize-btn">Finalise &amp; apply fines</button>
+            <button class="btn secondary" id="unlock-board-btn">Re-open board</button>
+          </div>
+          <div class="status-line" id="finalize-status"></div>
+        </div>
+
+        <div class="card">
+          <h2>Snapshots</h2>
+          <div class="status-line">Best-effort — saves automatically about once an hour while an organiser keeps this tab open, or save on demand.</div>
+          <div class="btn-row"><button class="btn secondary" id="snapshot-btn">Save snapshot now</button></div>
+          <div class="status-line" id="snapshot-status"></div>
+        </div>
+
+        <div class="card full-width">
+          <h2>Halfway meetup challenge</h2>
+          <div class="status-line">Set a meetup point and deadline. Any team whose GPS isn't within range by the deadline starts accruing a fine automatically, every 5 minutes, until they arrive.</div>
+          <label class="field-label">Meetup point (lat, lng)</label>
+          <div style="display:flex; gap:8px;">
+            <input type="number" step="0.00001" id="meetup-lat" style="flex:1;">
+            <input type="number" step="0.00001" id="meetup-lng" style="flex:1;">
+          </div>
+          <div class="btn-row"><button class="btn secondary" id="meetup-locate-btn">Use my location</button></div>
+          <label class="field-label">Deadline</label>
+          <input type="datetime-local" id="meetup-deadline">
+          <label class="field-label">Fine per 5 minutes late (£)</label>
+          <input type="number" id="meetup-fine" value="50">
+          <label class="field-label">Arrival radius (metres)</label>
+          <input type="number" id="meetup-radius" value="150">
+          <div class="btn-row">
+            <button class="btn" id="meetup-start-btn">Start challenge</button>
+            <button class="btn secondary" id="meetup-cancel-btn">Cancel challenge</button>
+          </div>
+          <div class="status-line" id="meetup-status"></div>
+        </div>
+
+        <div class="card">
+          <h2>Reset</h2>
+          <div class="status-line">Wipes all teams, ownership and tracking data. Settings are kept.</div>
+          <div class="btn-row"><button class="btn danger" id="admin-reset-btn">Reset all teams</button></div>
+        </div>
+      </div>
+
+      <div class="admin-subpanel" data-admin-panel="setup" style="display:none;">
+        <div class="card full-width">
+          <h2>Locations map</h2>
+          <div class="status-line">Drag a pin to correct its spot, or select one and type exact coordinates. Changes apply instantly everywhere — check-ins, compass, board.</div>
+          <div id="leaflet-map" style="margin-top:10px;"></div>
+          <div class="btn-row">
+            <button class="btn secondary" id="loc-locate-btn">Show my location on map</button>
+            <button class="btn secondary" id="loc-reset-all-btn">Reset all to defaults</button>
+            <button class="btn" id="edit-locations-table-btn">Edit locations (table view)</button>
+          </div>
+          <div id="loc-edit-panel" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid var(--grey1);">
+            <div class="status-line" id="loc-edit-name" style="font-weight:800; color:var(--navy); font-size:13px;"></div>
+            <label class="field-label">Latitude</label>
+            <input type="number" step="0.00001" id="loc-edit-lat">
+            <label class="field-label">Longitude</label>
+            <input type="number" step="0.00001" id="loc-edit-lng">
+            <div class="btn-row">
+              <button class="btn" id="loc-save-btn">Save coordinates</button>
+              <button class="btn secondary" id="loc-reset-btn">Reset this pin</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card full-width">
+          <h2>Chance &amp; Community Chest cards</h2>
+          <div class="status-line">These cards are specific to this game — edit freely without affecting any other game.</div>
+          <div id="cards-manager-list" style="margin-top:8px;"></div>
+          <div class="ba-divider"></div>
+          <label class="field-label">New card text</label>
+          <input type="text" id="new-card-text" placeholder="e.g. Found a £20 note on the pavement">
+          <label class="field-label">Effect</label>
+          <select id="new-card-effect-type">
+            <option value="cash">Cash amount</option>
+            <option value="flag">Bonus card (fine immunity / rent boost)</option>
+            <option value="auction">Trigger a property auction</option>
+          </select>
+          <input type="number" id="new-card-cash" placeholder="e.g. 200 or -150">
+          <select id="new-card-flag" style="display:none;">
+            <option value="fineImmunity">Fine Immunity</option>
+            <option value="rentBoost">Rent Boost</option>
+          </select>
+          <div class="btn-row">
+            <button class="btn" id="add-card-btn">Add card</button>
+            <button class="btn secondary" id="cancel-card-edit-btn" style="display:none;">Cancel edit</button>
+          </div>
+          <div class="status-line" id="add-card-status"></div>
+        </div>
+
+        <div class="card full-width">
+          <h2>Challenges</h2>
+          <div class="status-line">Standalone bonus tasks, separate from the board game. Teams tick them off as attempted from Play — approve here to award the bonus.</div>
+          <label class="field-label">Challenge title</label>
+          <input type="text" id="new-challenge-title" placeholder="e.g. Group photo at the London Eye">
+          <label class="field-label">Description (optional)</label>
+          <textarea id="new-challenge-desc" placeholder="What exactly counts as done?"></textarea>
+          <label class="field-label">Bonus (£)</label>
+          <input type="number" id="new-challenge-bonus" value="100">
+          <div class="btn-row"><button class="btn" id="add-challenge-btn">Add challenge</button></div>
+          <div class="status-line" id="add-challenge-status"></div>
+          <div class="ba-divider"></div>
+          <div id="challenges-list" style="margin-bottom:10px;"></div>
+          <h2>Submissions to review</h2>
+          <div id="challenge-submissions-list"></div>
+          <div class="btn-row"><button class="btn secondary" id="challenge-submissions-refresh-btn">Refresh</button></div>
+        </div>
+      </div>
+
+      <div class="admin-subpanel" data-admin-panel="log" style="display:none;">
+        <div class="card full-width">
+          <h2>Action log</h2>
+          <div class="status-line">Every scoring action in this game, newest first. Remove a wrong one and every team's score recalculates automatically from the remaining history — nothing else needs editing by hand.</div>
+          <div id="action-log-list" style="margin-top:8px;"></div>
+          <div class="btn-row"><button class="btn secondary" id="action-log-refresh-btn">Refresh</button></div>
+        </div>
       </div>
     </div>
   </section>
 
   <footer class="foot"><p>SHARED LIVE DATA · INTERNAL TEAM EVENT · NOT FOR EXTERNAL DISTRIBUTION</p></footer>
 </div>
+</div>
+
+<!-- ============ SHARED LOCATION EDITOR (templates + per-game boards) ============ -->
+<div id="loc-editor-modal" class="loc-editor-modal" style="display:none;">
+  <div class="loc-editor-inner">
+    <div class="loc-editor-header">
+      <div class="loc-editor-title" id="loc-editor-title">Editing locations</div>
+      <button class="btn secondary" id="loc-editor-close-btn">Done</button>
+    </div>
+    <div class="sort-row">
+      <button data-loc-tab="table" class="active">Table</button>
+      <button data-loc-tab="map">Map</button>
+      <button data-loc-tab="csv">Import CSV</button>
+    </div>
+
+    <div id="loc-editor-table-panel">
+      <div id="loc-editor-table-wrap"></div>
+      <div class="ba-divider"></div>
+      <h2 style="margin-top:0;">Add a location</h2>
+      <label class="field-label">Name</label>
+      <input type="text" id="le-name">
+      <label class="field-label">Group</label>
+      <input type="text" id="le-group" placeholder="e.g. Brown, Ground Floor">
+      <label class="field-label">Colour</label>
+      <input type="text" id="le-color" placeholder="#2E5C99" value="#2E5C99">
+      <label class="field-label">Type</label>
+      <select id="le-type">
+        <option value="street">Street / property</option>
+        <option value="station">Station</option>
+        <option value="special">Special (Chance-style draw point)</option>
+      </select>
+      <label class="field-label">Price (£)</label>
+      <input type="number" id="le-price" value="100">
+      <label class="field-label">Latitude</label>
+      <input type="number" step="0.00001" id="le-lat">
+      <label class="field-label">Longitude</label>
+      <input type="number" step="0.00001" id="le-lng">
+      <div class="btn-row"><button class="btn secondary" id="le-pick-map-btn">Pick on map instead</button></div>
+      <label class="field-label">Fun fact (optional)</label>
+      <input type="text" id="le-fact">
+      <label class="field-label">Note (optional — shown for special points)</label>
+      <input type="text" id="le-note">
+      <div class="btn-row">
+        <button class="btn" id="le-save-btn">Add location</button>
+        <button class="btn secondary" id="le-cancel-edit-btn" style="display:none;">Cancel edit</button>
+      </div>
+      <div class="status-line" id="le-status"></div>
+    </div>
+
+    <div id="loc-editor-map-panel" style="display:none;">
+      <div class="status-line">Drag any pin to move it. In "pick on map" mode, tap anywhere to set the new location's coordinates.</div>
+      <div id="loc-editor-map"></div>
+    </div>
+
+    <div id="loc-editor-csv-panel" style="display:none;">
+      <label class="field-label">Import CSV file</label>
+      <input type="file" accept=".csv,text/csv" id="le-csv-file">
+      <label class="field-label">CSV contents — columns: name, group, color, price, lat, lng, type, fact, note</label>
+      <textarea id="le-csv-input" placeholder="name,group,color,price,lat,lng,type,fact,note&#10;Reception Desk,Ground Floor,#2E5C99,100,51.4700,-0.4543,street,,&#10;Prize Draw,Special,#CE210F,0,51.4701,-0.4540,special,,Pull a card here"></textarea>
+      <div class="small-note">type is one of: street, station, or special (a Chance-style draw point — leave price/group blank). Importing adds these alongside anything already here — it doesn't replace the list.</div>
+      <div class="btn-row"><button class="btn" id="le-csv-import-btn">Import rows</button></div>
+      <div class="status-line" id="le-csv-status"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ GROUP MANAGER MODAL ============ -->
+<div id="group-editor-modal" class="loc-editor-modal" style="display:none;">
+  <div class="loc-editor-inner">
+    <div class="loc-editor-header">
+      <div class="loc-editor-title" id="group-editor-title">Managing group</div>
+      <button class="btn secondary" id="group-editor-close-btn">Done</button>
+    </div>
+    <div class="status-line">Add or remove games, then use the bulk controls to run them together.</div>
+    <label class="field-label">Add a game to this group</label>
+    <select id="group-add-game-select"></select>
+    <div class="btn-row"><button class="btn secondary" id="group-add-game-btn">Add to group</button></div>
+    <div class="ba-divider"></div>
+    <div id="group-member-games-list"></div>
+    <div class="ba-divider"></div>
+    <h2 style="margin-top:0;">Bulk controls</h2>
+    <div class="status-line">These act on every game currently in this group.</div>
+    <div class="btn-row">
+      <button class="btn secondary" id="group-unlock-all-btn">Start / re-open all</button>
+      <button class="btn danger" id="group-reset-all-btn">Reset all</button>
+      <button class="btn danger" id="group-finalize-all-btn">Finalise all</button>
+    </div>
+    <div class="status-line" id="group-bulk-status"></div>
+    <div class="ba-divider"></div>
+    <h2 style="margin-top:0;">Combined leaderboard</h2>
+    <div id="group-combined-leaderboard"></div>
+  </div>
 </div>
 
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>

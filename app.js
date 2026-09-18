@@ -52,17 +52,17 @@ const MONOPOLY_TEMPLATE_LOCATIONS = [
   {id:'chest', name:'Community Chest', group:'Special', color:'#CE210F', price:0, lat:51.5113, lng:-0.1174, type:'special', note:'Somerset House courtyard'},
 ];
 const DEFAULT_CARDS = [
-  {text:"Bank error in your favour", cash:200},
-  {text:"Speeding fine near Trafalgar Square", cash:-150},
-  {text:"Consultancy fee received", cash:100},
-  {text:"Doctor's fee", cash:-100},
-  {text:"HQ Christmas bonus", cash:300},
-  {text:"Lost your Oyster card, buy a new one", cash:-50},
-  {text:"A street performer tips you generously", cash:120},
-  {text:"Fine Immunity token — skips your biggest fine at the end", flag:'fineImmunity'},
-  {text:"Rent Multiplier — the next rent you collect is doubled", flag:'rentBoost'},
-  {text:"Tourist tax", cash:-80},
-  {text:"Property Auction \u2014 a sealed-bid auction just opened for a random property!", type:'auction'},
+  {text:"Complimentary upgrade to Club World — enjoy the extra legroom", cash:150},
+  {text:"Flight delayed — you miss your connection and rebook at your own cost", cash:-100},
+  {text:"Frequent flyer miles cashed in", cash:120},
+  {text:"Left your passport at security — mad dash back to collect it", cash:-80},
+  {text:"Crew commend your excellent behaviour — bonus per diem", cash:200},
+  {text:"Bag sent to the wrong carousel — taxi across the airport to retrieve it", cash:-60},
+  {text:"Found a forgotten travel voucher in your jacket pocket", cash:90},
+  {text:"Excess baggage fee", cash:-70},
+  {text:"Fast Track pass — skips your biggest fine at the end", flag:'fineImmunity'},
+  {text:"Upgrade voucher — the next rent you collect is doubled", flag:'rentBoost'},
+  {text:"Landing Rights Auction \u2014 a sealed-bid auction just opened for a random property!", type:'auction'},
 ];
 const STATION_RENT = {1:25, 2:50, 3:100, 4:200};
 const DEFAULT_CONFIG = {startMoney:1500, geofenceRadius:250, eventEnd:null, adminPasscode:'LONDON26', finalized:false, coordOverrides:{}, startPoint:{lat:51.5080, lng:-0.1281}};
@@ -95,7 +95,9 @@ async function loadGameData(){
       if(locations.length) applyLocations(locations);
     } else {
       // Lazy-seed so this game has its own persisted copy going forward.
-      await db.ref(gamePath('/locations')).set(PROPERTIES.concat(SPECIALS));
+      const seedLocs = {};
+      PROPERTIES.concat(SPECIALS).forEach(l=>{ seedLocs[l.id] = l; });
+      await db.ref(gamePath('/locations')).set(seedLocs);
     }
   }catch(e){}
   try{
@@ -220,11 +222,14 @@ function activityLine(entry){
   const time = new Date(entry.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
   let text = '';
   const d = entry.detail || {};
-  if(entry.type==='buy') text = `${entry.team} bought ${d.property}`;
-  else if(entry.type==='rent') text = `${entry.team} paid rent on ${d.property} to ${d.owner}`;
-  else if(entry.type==='chance') text = `${entry.team} drew a card at ${d.location}`;
-  else if(entry.type==='auction_won') text = `${entry.team} won ${d.property} at auction for £${d.amount}`;
+  if(entry.type==='buy') text = `${entry.team} bought ${d.propertyName}`;
+  else if(entry.type==='visit') text = `${entry.team} visited ${d.propertyName}`;
+  else if(entry.type==='rent') text = `${entry.team} paid rent on ${d.propertyName} to ${d.owner}`;
+  else if(entry.type==='chance_cash' || entry.type==='chance_flag' || entry.type==='chance_auction_trigger') text = `${entry.team} drew a card at ${d.locationLabel}`;
+  else if(entry.type==='auction_won') text = `${entry.team} won ${d.propertyName} at auction for £${d.amount}`;
   else if(entry.type==='meetup_fine') text = `${entry.team} fined £${d.amount} for missing the meetup deadline`;
+  else if(entry.type==='finalize_fine') text = `${entry.team} fined £${d.amount} for not visiting ${d.propertyName}`;
+  else if(entry.type==='challenge_bonus') text = `${entry.team} awarded £${d.amount} for "${d.challengeTitle}"`;
   else text = `${entry.team||''} ${entry.type}`;
   return `<div class="activity-row">${text}<div class="at">${time}</div></div>`;
 }
@@ -367,13 +372,32 @@ function switchView(viewName){
   document.querySelectorAll('section.view').forEach(v=>v.classList.toggle('active', v.id==='view-'+viewName));
   if(viewName==='leaderboard') renderLeaderboard();
   if(viewName==='board') renderBoardOverview();
-  if(viewName==='admin' && currentRole==='admin'){ renderTracking(); renderLocationsMap(); }
+  if(viewName==='admin' && currentRole==='admin'){ renderTracking(); }
 }
 document.querySelectorAll('nav.tabs button').forEach(btn=>{
   btn.addEventListener('click', ()=>{
     switchView(btn.dataset.view);
     const navEl = document.querySelector('nav.tabs');
     if(navEl) navEl.classList.remove('mobile-open');
+  });
+});
+document.querySelectorAll('#admin-subnav button').forEach(btn=>{
+  btn.addEventListener('click', async ()=>{
+    document.querySelectorAll('#admin-subnav button').forEach(b=>b.classList.toggle('active', b===btn));
+    document.querySelectorAll('.admin-subpanel').forEach(p=>{
+      p.style.display = (p.dataset.adminPanel === btn.dataset.adminTab) ? '' : 'none';
+    });
+    if(btn.dataset.adminTab === 'setup'){
+      renderLocationsMap();
+      renderCardsManager();
+      renderChallengesList();
+      renderChallengeSubmissions();
+      const teamsData = await listTeams();
+      renderTeamMarkersOnMap(teamsData);
+    }
+    if(btn.dataset.adminTab === 'log'){
+      renderActionLog();
+    }
   });
 });
 const topnavBurger = document.getElementById('topnav-burger');
@@ -386,6 +410,7 @@ if(topnavBurger){
 
 async function enterApp(role){
   currentRole = role;
+  await loadConfig();
   document.getElementById('role-gate').style.display = 'none';
   document.getElementById('app-main').style.display = 'block';
   configureNavForRole(role);
@@ -403,6 +428,7 @@ async function enterApp(role){
     renderStops();
     startGPS();
     renderOwnPropertyActivity();
+    renderTeamChallenges();
     if(activeAuctionListener) db.ref(gamePath('/activeAuction')).off('value', activeAuctionListener);
     activeAuctionListener = (snap)=>renderAuctionUI(snap.val());
     db.ref(gamePath('/activeAuction')).on('value', activeAuctionListener);
@@ -651,6 +677,7 @@ async function handleAction(action, propId){
   if(action === 'pass'){
     currentTeam.visited[propId] = Date.now();
     await saveTeam(currentTeam);
+    await logActivity('visit', currentTeam.name, {propertyId: prop.id, propertyName: prop.name});
     toast('Marked ' + prop.name + ' as visited.');
   } else if(action === 'buy'){
     if(owners[propId]){ toast('Someone just bought that — refreshing.'); }
@@ -662,7 +689,7 @@ async function handleAction(action, propId){
       currentTeam.visited[propId] = Date.now();
       currentTeam.lastPurchase = {name: prop.name, ts: Date.now()};
       await saveTeam(currentTeam);
-      await logActivity('buy', currentTeam.name, {property: prop.name});
+      await logActivity('buy', currentTeam.name, {propertyId: prop.id, propertyName: prop.name, price: prop.price});
       toast('Bought ' + prop.name + ' for £' + prop.price + '!');
     }
   } else if(action === 'rent'){
@@ -681,7 +708,7 @@ async function handleAction(action, propId){
       ownerTeam.cash += rent;
       await saveTeam(ownerTeam);
       await saveTeam(currentTeam);
-      await logActivity('rent', currentTeam.name, {property: prop.name, owner: ownerName, amount: rent});
+      await logActivity('rent', currentTeam.name, {propertyId: prop.id, propertyName: prop.name, owner: ownerName, amount: rent, boosted});
       toast('Paid £' + rent + ' rent to ' + ownerName + (boosted ? ' (doubled by their Rent Boost card!)' : '') + '.');
     }
   }
@@ -734,19 +761,19 @@ async function drawCard(specialId){
   const locationLabel = specialObj ? specialObj.name : specialId;
   if(card.type === 'auction'){
     await saveTeam(currentTeam);
-    await logActivity('chance', currentTeam.name, {location: locationLabel, text: card.text});
+    await logActivity('chance_auction_trigger', currentTeam.name, {specialId, locationLabel, text: card.text});
     await startAuction();
     toast(card.text, true);
   } else if(card.cash != null){
     currentTeam.cash += card.cash;
     await saveTeam(currentTeam);
-    await logActivity('chance', currentTeam.name, {location: locationLabel, text: card.text});
+    await logActivity('chance_cash', currentTeam.name, {specialId, locationLabel, text: card.text, cash: card.cash});
     toast(card.text + (card.cash>=0?' (+£':' (-£')+Math.abs(card.cash)+')', true);
   } else if(card.flag){
     currentTeam.cardFlags = currentTeam.cardFlags || {};
     currentTeam.cardFlags[card.flag] = (currentTeam.cardFlags[card.flag]||0) + 1;
     await saveTeam(currentTeam);
-    await logActivity('chance', currentTeam.name, {location: locationLabel, text: card.text});
+    await logActivity('chance_flag', currentTeam.name, {specialId, locationLabel, text: card.text, flag: card.flag});
     toast(card.text + ' (bonus card added)', true);
   }
   refreshWallet();
@@ -799,15 +826,35 @@ function nearestLabelFor(loc){
 }
 async function renderLeaderboard(){
   const listEl = document.getElementById('leaderboard-list');
+  const podiumEl = document.getElementById('podium-section');
   listEl.innerHTML = '<div class="empty">Loading standings…</div>';
   const teamsData = await listTeams();
   const teams = Object.values(teamsData);
-  if(teams.length === 0){ listEl.innerHTML = '<div class="empty">No teams registered yet.</div>'; renderActivityFeed('public-activity-list', 15); return; }
+  if(teams.length === 0){ listEl.innerHTML = '<div class="empty">No teams registered yet.</div>'; if(podiumEl) podiumEl.style.display = 'none'; renderActivityFeed('public-activity-list', 15); return; }
   teams.forEach(t=>{
     const portfolioValue = (t.owned||[]).reduce((sum,id)=>{ const p=PROPERTIES.find(pp=>pp.id===id); return sum+(p?p.price:0); },0);
     t.netWorth = (t.cash||0) + portfolioValue;
   });
   teams.sort((a,b)=>b.netWorth - a.netWorth);
+  if(podiumEl){
+    if(config.finalized){
+      const medals = ['🥇','🥈','🥉'];
+      const podiumHtml = teams.slice(0,3).map((t,i)=>`
+        <div style="flex:1; text-align:center; background:${i===0?'var(--ba-blue-dark)':'var(--white)'}; color:${i===0?'var(--white)':'var(--navy)'}; border:1px solid #ddd; border-radius:8px; padding:${i===0?'22px 12px':'14px 10px'}; ${i===0?'order:2;':i===1?'order:1;':'order:3;'}">
+          <div style="font-size:${i===0?'34px':'26px'};">${medals[i]}</div>
+          <div style="font-weight:800; font-size:${i===0?'15px':'13px'}; margin-top:4px;">${t.icon?t.icon+' ':''}${t.name}</div>
+          <div style="font-size:11px; opacity:0.8; margin-top:2px;">£${t.netWorth}</div>
+        </div>`).join('');
+      podiumEl.innerHTML = `
+        <div class="card" style="text-align:center;">
+          <h2 style="font-size:16px; text-transform:none; letter-spacing:0; color:var(--navy);">🏆 Final Results</h2>
+          <div style="display:flex; align-items:flex-end; gap:10px; margin-top:10px;">${podiumHtml}</div>
+        </div>`;
+      podiumEl.style.display = 'block';
+    } else {
+      podiumEl.style.display = 'none';
+    }
+  }
   const rows = teams.map((t,i)=>{
     const lastBought = t.lastPurchase ? t.lastPurchase.name : 'none yet';
     return `<tr>
@@ -966,12 +1013,16 @@ async function renderTeamLinks(){
   for(const t of teams){
     if(!t.token){ t.token = generateToken(); await saveTeam(t); }
     const link = base + '?game=' + encodeURIComponent(currentGameId) + '&team=' + encodeURIComponent(t.token);
+    const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=' + encodeURIComponent(link);
     const row = document.createElement('div');
     row.className = 'track-row';
+    row.style.alignItems = 'center';
     row.innerHTML = `
-      <div class="track-name" style="flex:0 0 120px;">${t.name}</div>
+      <img src="${qrUrl}" alt="QR code for ${t.name}" width="44" height="44" style="border-radius:4px; border:1px solid #ddd; flex-shrink:0;">
+      <div class="track-name" style="flex:0 0 120px;">${t.icon?t.icon+' ':''}${t.name}</div>
       <input type="text" readonly value="${link}" style="flex:1; font-size:11px; padding:6px 8px; border-radius:6px; border:1px solid var(--grey1);" onclick="this.select()">
       <button class="btn secondary" data-copy-link="${link}" style="padding:6px 10px; font-size:11px; flex-shrink:0;">Copy</button>
+      <a class="btn secondary" href="${qrUrl.replace('120x120','400x400')}" target="_blank" style="padding:6px 10px; font-size:11px; flex-shrink:0; text-decoration:none;">Print QR</a>
     `;
     el.appendChild(row);
   }
@@ -985,6 +1036,7 @@ async function renderTeamLinks(){
 document.getElementById('team-links-refresh-btn').addEventListener('click', renderTeamLinks);
 
 // ================= CHANCE CARDS MANAGER (per game) =================
+let editingCardId = null;
 document.getElementById('new-card-effect-type').addEventListener('change', (e)=>{
   document.getElementById('new-card-cash').style.display = e.target.value === 'cash' ? 'block' : 'none';
   document.getElementById('new-card-flag').style.display = e.target.value === 'flag' ? 'block' : 'none';
@@ -998,17 +1050,47 @@ function renderCardsManager(){
     if(c.cash != null) effectLabel = (c.cash>=0?'+£':'-£') + Math.abs(c.cash);
     else if(c.flag) effectLabel = c.flag === 'fineImmunity' ? 'Fine Immunity' : 'Rent Boost';
     else if(c.type === 'auction') effectLabel = 'Triggers auction';
-    return `<div class="track-row"><div class="track-name" style="flex:1;">${c.text} <span style="color:var(--ba-warm-grey); font-weight:400;">(${effectLabel})</span></div><button class="btn danger" data-delete-card="${c.id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
+    return `<div class="track-row"><div class="track-name" style="flex:1;">${c.text} <span style="color:var(--ba-warm-grey); font-weight:400;">(${effectLabel})</span></div>
+      <button class="btn secondary" data-edit-card="${c.id}" style="padding:4px 8px; font-size:10.5px;">Edit</button>
+      <button class="btn danger" data-delete-card="${c.id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
   }).join('');
   el.querySelectorAll('[data-delete-card]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       if(!confirm('Delete this card?')) return;
       await db.ref(gamePath('/cards/'+btn.dataset.deleteCard)).remove();
       CARDS = CARDS.filter(c=>c.id !== btn.dataset.deleteCard);
+      if(editingCardId === btn.dataset.deleteCard) cancelCardEdit();
       renderCardsManager();
     });
   });
+  el.querySelectorAll('[data-edit-card]').forEach(btn=>{
+    btn.addEventListener('click', ()=>startCardEdit(btn.dataset.editCard));
+  });
 }
+function startCardEdit(cardId){
+  const card = CARDS.find(c=>c.id === cardId);
+  if(!card) return;
+  editingCardId = cardId;
+  document.getElementById('new-card-text').value = card.text || '';
+  const effectType = card.type === 'auction' ? 'auction' : card.flag ? 'flag' : 'cash';
+  document.getElementById('new-card-effect-type').value = effectType;
+  document.getElementById('new-card-effect-type').dispatchEvent(new Event('change'));
+  document.getElementById('new-card-cash').value = card.cash != null ? card.cash : '';
+  if(card.flag) document.getElementById('new-card-flag').value = card.flag;
+  document.getElementById('add-card-btn').textContent = 'Save changes';
+  document.getElementById('cancel-card-edit-btn').style.display = 'inline-block';
+  document.getElementById('add-card-status').textContent = 'Editing "' + card.text + '" — change the fields above and save.';
+  document.getElementById('add-card-status').className = 'status-line warn';
+}
+function cancelCardEdit(){
+  editingCardId = null;
+  document.getElementById('new-card-text').value = '';
+  document.getElementById('new-card-cash').value = '';
+  document.getElementById('add-card-btn').textContent = 'Add card';
+  document.getElementById('cancel-card-edit-btn').style.display = 'none';
+  document.getElementById('add-card-status').textContent = '';
+}
+document.getElementById('cancel-card-edit-btn').addEventListener('click', cancelCardEdit);
 document.getElementById('add-card-btn').addEventListener('click', async ()=>{
   const text = document.getElementById('new-card-text').value.trim();
   const effectType = document.getElementById('new-card-effect-type').value;
@@ -1024,13 +1106,22 @@ document.getElementById('add-card-btn').addEventListener('click', async ()=>{
   } else if(effectType === 'auction'){
     card.type = 'auction';
   }
-  const ref = db.ref(gamePath('/cards')).push();
-  await ref.set(card);
-  CARDS.push({...card, id: ref.key});
-  document.getElementById('new-card-text').value = '';
-  document.getElementById('new-card-cash').value = '';
-  statusEl.textContent = 'Card added.';
-  statusEl.className = 'status-line good';
+  if(editingCardId){
+    await db.ref(gamePath('/cards/'+editingCardId)).set(card);
+    const idx = CARDS.findIndex(c=>c.id === editingCardId);
+    if(idx >= 0) CARDS[idx] = {...card, id: editingCardId};
+    statusEl.textContent = 'Card updated.';
+    statusEl.className = 'status-line good';
+    cancelCardEdit();
+  } else {
+    const ref = db.ref(gamePath('/cards')).push();
+    await ref.set(card);
+    CARDS.push({...card, id: ref.key});
+    document.getElementById('new-card-text').value = '';
+    document.getElementById('new-card-cash').value = '';
+    statusEl.textContent = 'Card added.';
+    statusEl.className = 'status-line good';
+  }
   renderCardsManager();
 });
 
@@ -1071,7 +1162,7 @@ function makeTeamPinIcon(stale, icon){
   });
 }
 function renderTeamMarkersOnMap(teamsData){
-  ensureLeafletMap();
+  if(!leafletMap) return; // Locations map hasn't been opened yet this session — nothing to draw on.
   teamMarkersLayer.clearLayers();
   Object.values(teamsData).forEach(t=>{
     if(!t.lastLocation) return;
@@ -1261,7 +1352,7 @@ async function tryResolveAuction(){
         resultText = `${winnerTeam.name} won ${prop.name} for £${winnerAmt}.`;
       }
       await saveTeam(winnerTeam);
-      await logActivity('auction_won', winnerTeam.name, {property: prop.name, amount: winnerAmt});
+      await logActivity('auction_won', winnerTeam.name, {propertyId: prop.id, propertyName: prop.name, amount: winnerAmt, prevOwner: (prevOwnerName && prevOwnerName !== winnerTeam.name) ? prevOwnerName : null});
     }
   }
   await db.ref(gamePath('/activeAuction')).update({result:{text: resultText}});
@@ -1357,10 +1448,11 @@ document.getElementById('finalize-btn').addEventListener('click', async ()=>{
     fines.sort((a,b)=>b.fine-a.fine);
     t.cardFlags = t.cardFlags || {};
     let immunity = t.cardFlags.fineImmunity || 0;
-    fines.forEach(f=>{
-      if(immunity > 0){ immunity -= 1; return; }
+    for(const f of fines){
+      if(immunity > 0){ immunity -= 1; continue; }
       t.cash -= f.fine;
-    });
+      await logActivity('finalize_fine', t.name, {propertyId: f.p.id, propertyName: f.p.name, amount: f.fine});
+    }
     t.cardFlags.fineImmunity = immunity;
     await saveTeam(t);
   }
@@ -1376,11 +1468,12 @@ document.getElementById('unlock-board-btn').addEventListener('click', async ()=>
   document.getElementById('finalize-status').textContent = 'Board re-opened.';
 });
 document.getElementById('admin-reset-btn').addEventListener('click', async ()=>{
-  if(!confirm('This wipes every team, plus the activity log, live auction and meetup challenge. Continue?')) return;
+  if(!confirm('This wipes every team, plus the activity log, live auction, meetup challenge, and challenge submissions. Continue?')) return;
   await db.ref(gamePath('/teams')).remove();
   await db.ref(gamePath('/activity')).remove();
   await db.ref(gamePath('/activeAuction')).remove();
   await db.ref(gamePath('/meetup')).remove();
+  await db.ref(gamePath('/challengeSubmissions')).remove();
   config.finalized = false;
   await saveConfig();
   renderTracking();
@@ -1518,10 +1611,38 @@ document.getElementById('cc-unlock-btn').addEventListener('click', async ()=>{
   document.getElementById('cc-gate-card').style.display = 'none';
   document.getElementById('cc-panel').style.display = 'block';
   document.getElementById('cc-passcode-input').value = real;
+  renderCcStats();
   renderGamesList();
   renderTemplatesList();
   populateGameTemplateOptions();
+  renderGroupsList();
 });
+document.querySelectorAll('#cc-subnav button').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    document.querySelectorAll('#cc-subnav button').forEach(b=>b.classList.toggle('active', b===btn));
+    document.querySelectorAll('[data-cc-panel]').forEach(p=>{
+      p.style.display = (p.dataset.ccPanel === btn.dataset.ccTab) ? '' : 'none';
+    });
+    if(btn.dataset.ccTab === 'games') renderGamesList();
+    if(btn.dataset.ccTab === 'groups') renderGroupsList();
+    if(btn.dataset.ccTab === 'templates'){ renderTemplatesList(); populateGameTemplateOptions(); }
+  });
+});
+async function renderCcStats(){
+  const el = document.getElementById('cc-stats-line');
+  if(!el) return;
+  try{
+    const [gamesSnap, groupsSnap, tplSnap] = await Promise.all([
+      db.ref('games').once('value'),
+      db.ref('groups').once('value'),
+      db.ref('templates').once('value')
+    ]);
+    const gameCount = gamesSnap.exists() ? Object.keys(gamesSnap.val()).length : 0;
+    const groupCount = groupsSnap.exists() ? Object.keys(groupsSnap.val()).length : 0;
+    const tplCount = tplSnap.exists() ? Object.keys(tplSnap.val()).length : 0;
+    el.textContent = `${gameCount} game${gameCount===1?'':'s'} · ${groupCount} group${groupCount===1?'':'s'} · ${tplCount} custom template${tplCount===1?'':'s'}`;
+  }catch(e){ el.textContent = ''; }
+}
 document.getElementById('cc-passcode-save-btn').addEventListener('click', async ()=>{
   const val = document.getElementById('cc-passcode-input').value.trim();
   if(!val){ return; }
@@ -1541,7 +1662,9 @@ document.getElementById('cc-create-btn').addEventListener('click', async ()=>{
   const statusEl = document.getElementById('cc-create-status');
   if(!name){ statusEl.textContent = 'Give the game a name first.'; statusEl.className = 'status-line err'; return; }
   let locations;
-  if(templateId === 'monopoly-builtin'){
+  if(templateId === 'blank-custom'){
+    locations = [];
+  } else if(templateId === 'monopoly-builtin'){
     locations = MONOPOLY_TEMPLATE_LOCATIONS.map(l=>({...l}));
   } else {
     try{
@@ -1552,7 +1675,9 @@ document.getElementById('cc-create-btn').addEventListener('click', async ()=>{
   const id = ccGenerateGameId(name);
   await db.ref('games/'+id+'/meta').set({name, createdAt: Date.now(), archived: false});
   await db.ref('games/'+id+'/config').set(DEFAULT_CONFIG);
-  await db.ref('games/'+id+'/locations').set(locations);
+  const locMap = {};
+  locations.forEach(l=>{ locMap[l.id] = l; });
+  await db.ref('games/'+id+'/locations').set(locMap);
   const cardSeed = {};
   DEFAULT_CARDS.forEach(c=>{ const key = db.ref('games/'+id+'/cards').push().key; cardSeed[key] = c; });
   await db.ref('games/'+id+'/cards').set(cardSeed);
@@ -1560,6 +1685,7 @@ document.getElementById('cc-create-btn').addEventListener('click', async ()=>{
   statusEl.className = 'status-line good';
   document.getElementById('cc-new-name').value = '';
   renderGamesList();
+  renderCcStats();
 });
 document.getElementById('cc-show-archived').addEventListener('change', renderGamesList);
 document.getElementById('cc-refresh-btn').addEventListener('click', renderGamesList);
@@ -1606,36 +1732,24 @@ function ccCsvRowsToLocations(rows){
     };
   }).filter(Boolean);
 }
-document.getElementById('tpl-csv-file').addEventListener('change', (e)=>{
-  const file = e.target.files[0];
-  if(!file) return;
-  const reader = new FileReader();
-  reader.onload = (ev)=>{ document.getElementById('tpl-csv-input').value = ev.target.result; };
-  reader.readAsText(file);
-});
 document.getElementById('tpl-create-btn').addEventListener('click', async ()=>{
   const name = document.getElementById('tpl-new-name').value.trim();
   const source = document.getElementById('tpl-source').value;
-  const csvText = document.getElementById('tpl-csv-input').value.trim();
   const statusEl = document.getElementById('tpl-create-status');
   if(!name){ statusEl.textContent = 'Give the template a name first.'; statusEl.className = 'status-line err'; return; }
-  let locations = [];
-  if(csvText){
-    locations = ccCsvRowsToLocations(ccParseCsv(csvText));
-  } else if(source === 'monopoly'){
-    locations = MONOPOLY_TEMPLATE_LOCATIONS.map(l=>({...l}));
-  }
-  if(locations.length === 0){ statusEl.textContent = 'Add at least one location — import a CSV or start from Monopoly.'; statusEl.className = 'status-line err'; return; }
+  const locations = source === 'monopoly' ? MONOPOLY_TEMPLATE_LOCATIONS.map(l=>({...l})) : [];
   const id = ccGenerateGameId(name);
   await db.ref('templates/'+id+'/meta').set({name, createdAt: Date.now(), count: locations.length});
-  await db.ref('templates/'+id+'/locations').set(locations);
-  statusEl.textContent = `Template "${name}" created with ${locations.length} locations.`;
+  const locMap = {};
+  locations.forEach(l=>{ locMap[l.id] = l; });
+  await db.ref('templates/'+id+'/locations').set(locMap);
+  statusEl.textContent = `Template "${name}" created — add its locations below.`;
   statusEl.className = 'status-line good';
   document.getElementById('tpl-new-name').value = '';
-  document.getElementById('tpl-csv-input').value = '';
-  document.getElementById('tpl-csv-file').value = '';
   renderTemplatesList();
   populateGameTemplateOptions();
+  renderCcStats();
+  openLocationEditor('templates/'+id+'/locations', 'Editing "'+name+'"', 'templates/'+id+'/meta/count');
 });
 document.getElementById('tpl-refresh-btn').addEventListener('click', ()=>{ renderTemplatesList(); populateGameTemplateOptions(); });
 
@@ -1649,7 +1763,9 @@ async function renderTemplatesList(){
     const val = snap.val();
     const rows = Object.keys(val).map(id=>{
       const meta = val[id].meta || {};
-      return `<div class="track-row"><div class="track-name" style="flex:1;">${meta.name || id} <span style="color:var(--ba-warm-grey); font-weight:400;">(${meta.count||0} locations)</span></div><button class="btn danger" data-delete-tpl="${id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
+      return `<div class="track-row"><div class="track-name" style="flex:1;">${meta.name || id} <span style="color:var(--ba-warm-grey); font-weight:400;">(${meta.count||0} locations)</span></div>
+        <button class="btn secondary" data-edit-tpl="${id}" data-edit-tpl-name="${meta.name || id}" style="padding:4px 8px; font-size:10.5px;">Edit</button>
+        <button class="btn danger" data-delete-tpl="${id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
     }).join('');
     el.innerHTML = rows;
     el.querySelectorAll('[data-delete-tpl]').forEach(btn=>{
@@ -1658,6 +1774,13 @@ async function renderTemplatesList(){
         await db.ref('templates/'+btn.dataset.deleteTpl).remove();
         renderTemplatesList();
         populateGameTemplateOptions();
+        renderCcStats();
+      });
+    });
+    el.querySelectorAll('[data-edit-tpl]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        const id = btn.dataset.editTpl;
+        openLocationEditor('templates/'+id+'/locations', 'Editing "'+btn.dataset.editTplName+'"', 'templates/'+id+'/meta/count');
       });
     });
   }catch(e){ el.innerHTML = '<div class="empty">Could not load templates.</div>'; }
@@ -1759,6 +1882,7 @@ async function renderGamesList(){
       if(!confirm('Permanently delete this game and all its teams, activity and settings? This cannot be undone.')) return;
       await db.ref('games/'+id).remove();
       renderGamesList();
+      renderCcStats();
     });
   });
 }
@@ -1770,6 +1894,738 @@ document.getElementById('all-games-btn').addEventListener('click', ()=>{
 });
 
 // ================= BOOTSTRAP =================
+// ================= SHARED LOCATION EDITOR =================
+// Used for: creating/editing a template's locations, and editing a live
+// game's own board. Writes each location individually (keyed by its id)
+// so add/edit/delete never require resaving the whole list.
+let locEditorRefPath = null;
+let locEditorMetaCountPath = null;
+let locEditorLocations = [];
+let locEditorEditingId = null;
+let locEditorPickingOnMap = false;
+let locEditorMap = null, locEditorMarkersLayer = null;
+
+async function openLocationEditor(refPath, title, metaCountPath){
+  locEditorRefPath = refPath;
+  locEditorMetaCountPath = metaCountPath || null;
+  document.getElementById('loc-editor-title').textContent = title;
+  let locations = [];
+  try{
+    const snap = await db.ref(refPath).once('value');
+    const val = snap.val();
+    locations = val ? (Array.isArray(val) ? val.filter(Boolean) : Object.values(val)) : [];
+  }catch(e){}
+  locEditorLocations = locations;
+  cancelLocEdit();
+  document.getElementById('loc-editor-modal').style.display = 'flex';
+  switchLocEditorTab('table');
+  renderLocEditorTable();
+}
+async function closeLocationEditor(){
+  document.getElementById('loc-editor-modal').style.display = 'none';
+  const wasGameOwnLocations = (currentGameId && locEditorRefPath === gamePath('/locations'));
+  locEditorRefPath = null;
+  if(wasGameOwnLocations){
+    try{
+      const snap = await db.ref(gamePath('/locations')).once('value');
+      const val = snap.val();
+      const locations = val ? (Array.isArray(val) ? val.filter(Boolean) : Object.values(val)) : [];
+      if(locations.length) applyLocations(locations);
+      renderLocationsMap();
+      toast('Board updated with your changes.');
+    }catch(e){}
+  }
+}
+document.getElementById('loc-editor-close-btn').addEventListener('click', closeLocationEditor);
+
+document.querySelectorAll('[data-loc-tab]').forEach(btn=>{
+  btn.addEventListener('click', ()=>switchLocEditorTab(btn.dataset.locTab));
+});
+function switchLocEditorTab(tab){
+  document.querySelectorAll('[data-loc-tab]').forEach(b=>b.classList.toggle('active', b.dataset.locTab===tab));
+  document.getElementById('loc-editor-table-panel').style.display = tab==='table' ? 'block' : 'none';
+  document.getElementById('loc-editor-map-panel').style.display = tab==='map' ? 'block' : 'none';
+  document.getElementById('loc-editor-csv-panel').style.display = tab==='csv' ? 'block' : 'none';
+  if(tab==='map') renderLocEditorMap();
+}
+
+function renderLocEditorTable(){
+  const el = document.getElementById('loc-editor-table-wrap');
+  if(!el) return;
+  if(locEditorLocations.length === 0){ el.innerHTML = '<div class="empty">No locations yet — add one below, import a CSV, or drop pins on the map.</div>'; return; }
+  const rows = locEditorLocations.map(l=>`<tr>
+    <td><strong>${l.name}</strong></td>
+    <td>${l.group||''}</td>
+    <td>${l.type}</td>
+    <td>£${l.price||0}</td>
+    <td>${l.lat!=null?l.lat.toFixed(4):'—'}, ${l.lng!=null?l.lng.toFixed(4):'—'}</td>
+    <td style="white-space:nowrap;">
+      <button class="btn secondary" data-le-edit="${l.id}" style="padding:4px 8px; font-size:10px;">Edit</button>
+      <button class="btn danger" data-le-delete="${l.id}" style="padding:4px 8px; font-size:10px;">Delete</button>
+    </td>
+  </tr>`).join('');
+  el.innerHTML = `<div class="scroll-x"><table class="ba-table"><thead><tr><th>Name</th><th>Group</th><th>Type</th><th>Price</th><th>Coordinates</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  el.querySelectorAll('[data-le-edit]').forEach(btn=>btn.addEventListener('click', ()=>startLocEdit(btn.dataset.leEdit)));
+  el.querySelectorAll('[data-le-delete]').forEach(btn=>btn.addEventListener('click', ()=>deleteLocEditorLocation(btn.dataset.leDelete)));
+}
+async function syncTemplateMetaCount(){
+  if(locEditorMetaCountPath){
+    try{ await db.ref(locEditorMetaCountPath).set(locEditorLocations.length); }catch(e){}
+  }
+}
+function genLocId(){ return 'loc_' + Math.random().toString(36).slice(2,9); }
+function startLocEdit(id){
+  const loc = locEditorLocations.find(l=>l.id===id);
+  if(!loc) return;
+  locEditorEditingId = id;
+  document.getElementById('le-name').value = loc.name || '';
+  document.getElementById('le-group').value = loc.group || '';
+  document.getElementById('le-color').value = loc.color || '#2E5C99';
+  document.getElementById('le-type').value = loc.type || 'street';
+  document.getElementById('le-price').value = loc.price || 0;
+  document.getElementById('le-lat').value = loc.lat != null ? loc.lat : '';
+  document.getElementById('le-lng').value = loc.lng != null ? loc.lng : '';
+  document.getElementById('le-fact').value = loc.fact || '';
+  document.getElementById('le-note').value = loc.note || '';
+  document.getElementById('le-save-btn').textContent = 'Save changes';
+  document.getElementById('le-cancel-edit-btn').style.display = 'inline-block';
+  switchLocEditorTab('table');
+}
+function cancelLocEdit(){
+  locEditorEditingId = null;
+  locEditorPickingOnMap = false;
+  ['le-name','le-group','le-price','le-lat','le-lng','le-fact','le-note'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.value = '';
+  });
+  const colorEl = document.getElementById('le-color'); if(colorEl) colorEl.value = '#2E5C99';
+  const typeEl = document.getElementById('le-type'); if(typeEl) typeEl.value = 'street';
+  const saveBtn = document.getElementById('le-save-btn'); if(saveBtn) saveBtn.textContent = 'Add location';
+  const cancelBtn = document.getElementById('le-cancel-edit-btn'); if(cancelBtn) cancelBtn.style.display = 'none';
+  const statusEl = document.getElementById('le-status'); if(statusEl) statusEl.textContent = '';
+}
+document.getElementById('le-cancel-edit-btn').addEventListener('click', cancelLocEdit);
+document.getElementById('le-save-btn').addEventListener('click', async ()=>{
+  const name = document.getElementById('le-name').value.trim();
+  const statusEl = document.getElementById('le-status');
+  if(!name){ statusEl.textContent = 'Give it a name.'; statusEl.className = 'status-line err'; return; }
+  const lat = parseFloat(document.getElementById('le-lat').value);
+  const lng = parseFloat(document.getElementById('le-lng').value);
+  if(isNaN(lat) || isNaN(lng)){ statusEl.textContent = 'Set coordinates — type them or pick on the map.'; statusEl.className = 'status-line err'; return; }
+  const type = document.getElementById('le-type').value;
+  const loc = {
+    id: locEditorEditingId || genLocId(),
+    name,
+    group: type==='special' ? 'Special' : (document.getElementById('le-group').value.trim() || 'General'),
+    color: document.getElementById('le-color').value.trim() || '#2E5C99',
+    price: type==='special' ? 0 : (parseInt(document.getElementById('le-price').value) || 0),
+    lat, lng, type,
+    fact: document.getElementById('le-fact').value.trim(),
+    note: document.getElementById('le-note').value.trim()
+  };
+  await db.ref(locEditorRefPath + '/' + loc.id).set(loc);
+  const idx = locEditorLocations.findIndex(l=>l.id===loc.id);
+  if(idx >= 0) locEditorLocations[idx] = loc; else locEditorLocations.push(loc);
+  await syncTemplateMetaCount();
+  cancelLocEdit();
+  renderLocEditorTable();
+  if(document.getElementById('loc-editor-map-panel').style.display !== 'none') renderLocEditorMap();
+  statusEl.textContent = 'Saved.';
+  statusEl.className = 'status-line good';
+});
+async function deleteLocEditorLocation(id){
+  if(!confirm('Delete this location?')) return;
+  await db.ref(locEditorRefPath + '/' + id).remove();
+  locEditorLocations = locEditorLocations.filter(l=>l.id !== id);
+  await syncTemplateMetaCount();
+  renderLocEditorTable();
+  if(document.getElementById('loc-editor-map-panel').style.display !== 'none') renderLocEditorMap();
+}
+
+function renderLocEditorMap(){
+  if(!locEditorMap){
+    locEditorMap = L.map('loc-editor-map').setView([51.510,-0.125], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(locEditorMap);
+    locEditorMarkersLayer = L.layerGroup().addTo(locEditorMap);
+    locEditorMap.on('click', (e)=>{
+      if(!locEditorPickingOnMap) return;
+      document.getElementById('le-lat').value = e.latlng.lat.toFixed(5);
+      document.getElementById('le-lng').value = e.latlng.lng.toFixed(5);
+      locEditorPickingOnMap = false;
+      switchLocEditorTab('table');
+      toast('Location set — fill in the name and save.');
+    });
+  }
+  locEditorMarkersLayer.clearLayers();
+  locEditorLocations.forEach(l=>{
+    if(l.lat == null || l.lng == null) return;
+    const icon = L.divIcon({className:'', html:`<div style="width:14px;height:14px;border-radius:50%;background:${l.color||'#2E5C99'};border:2px solid white;box-shadow:0 1px 4px rgba(0,0,0,0.5);"></div>`, iconSize:[14,14], iconAnchor:[7,7]});
+    const marker = L.marker([l.lat, l.lng], {icon, draggable:true, title:l.name});
+    marker.bindTooltip(l.name, {direction:'top', offset:[0,-10]});
+    marker.on('dragend', async (e)=>{
+      const pos = e.target.getLatLng();
+      l.lat = pos.lat; l.lng = pos.lng;
+      await db.ref(locEditorRefPath + '/' + l.id).set(l);
+      renderLocEditorTable();
+    });
+    marker.addTo(locEditorMarkersLayer);
+  });
+  setTimeout(()=>{ if(locEditorMap) locEditorMap.invalidateSize(); }, 60);
+}
+document.getElementById('le-pick-map-btn').addEventListener('click', ()=>{
+  locEditorPickingOnMap = true;
+  switchLocEditorTab('map');
+  toast('Tap the map where this location should be.');
+});
+
+document.getElementById('le-csv-file').addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev)=>{ document.getElementById('le-csv-input').value = ev.target.result; };
+  reader.readAsText(file);
+});
+document.getElementById('le-csv-import-btn').addEventListener('click', async ()=>{
+  const text = document.getElementById('le-csv-input').value.trim();
+  const statusEl = document.getElementById('le-csv-status');
+  if(!text){ statusEl.textContent = 'Paste or upload CSV first.'; statusEl.className = 'status-line err'; return; }
+  const newLocs = ccCsvRowsToLocations(ccParseCsv(text));
+  if(newLocs.length === 0){ statusEl.textContent = 'No valid rows found — check the lat/lng columns.'; statusEl.className = 'status-line err'; return; }
+  const updates = {};
+  newLocs.forEach(l=>{ updates[l.id] = l; });
+  await db.ref(locEditorRefPath).update(updates);
+  locEditorLocations = locEditorLocations.concat(newLocs);
+  await syncTemplateMetaCount();
+  document.getElementById('le-csv-input').value = '';
+  document.getElementById('le-csv-file').value = '';
+  statusEl.textContent = `Imported ${newLocs.length} location(s).`;
+  statusEl.className = 'status-line good';
+  renderLocEditorTable();
+  switchLocEditorTab('table');
+});
+
+document.getElementById('edit-locations-table-btn').addEventListener('click', ()=>{
+  openLocationEditor(gamePath('/locations'), 'Editing locations for "' + (currentGameName || 'this game') + '"', null);
+});
+
+// ================= RECALCULATION ENGINE =================
+// Rebuilds every team's cash/ownership/visited state from scratch by
+// replaying the full activity log in order. Used whenever an admin
+// removes a bad log entry, so scores stay trustworthy.
+// Known limitation: bonus-card flags (Fine Immunity / Rent Boost) are
+// re-granted by replay but their *consumption* isn't perfectly replayed
+// (a rent entry's amount already reflects whether a boost was used, so
+// cash stays accurate — but a team's remaining flag count afterwards
+// may not exactly match what it was in the moment). Cash and ownership,
+// the numbers that actually matter for a fairness fix, are exact.
+async function recalculateGameFromLog(){
+  const teamsData = await listTeams();
+  const reset = {};
+  Object.values(teamsData).forEach(t=>{
+    reset[t.name] = {
+      ...t,
+      cash: config.startMoney,
+      owned: [],
+      visited: {},
+      cardFlags: {},
+      specialDraws: {},
+      lastPurchase: null
+    };
+  });
+  let entries = [];
+  try{
+    const snap = await db.ref(gamePath('/activity')).once('value');
+    if(snap.exists()){
+      const val = snap.val();
+      entries = Object.keys(val).map(k=>({...val[k], logId:k})).sort((a,b)=>a.ts-b.ts);
+    }
+  }catch(e){}
+
+  entries.forEach(e=>{
+    const d = e.detail || {};
+    const team = reset[e.team];
+    if(!team) return;
+    if(e.type === 'buy'){
+      team.cash -= d.price;
+      team.owned.push(d.propertyId);
+      team.visited[d.propertyId] = e.ts;
+      team.lastPurchase = {name: d.propertyName, ts: e.ts};
+    } else if(e.type === 'visit'){
+      team.visited[d.propertyId] = e.ts;
+    } else if(e.type === 'rent'){
+      team.cash -= d.amount;
+      team.visited[d.propertyId] = e.ts;
+      const owner = reset[d.owner];
+      if(owner){
+        owner.cash += d.amount;
+        if(d.boosted && owner.cardFlags.rentBoost > 0) owner.cardFlags.rentBoost -= 1;
+      }
+    } else if(e.type === 'chance_cash'){
+      team.cash += d.cash;
+      team.specialDraws[d.specialId] = true;
+    } else if(e.type === 'chance_flag'){
+      team.cardFlags[d.flag] = (team.cardFlags[d.flag]||0) + 1;
+      team.specialDraws[d.specialId] = true;
+    } else if(e.type === 'chance_auction_trigger'){
+      team.specialDraws[d.specialId] = true;
+    } else if(e.type === 'auction_won'){
+      team.cash -= d.amount;
+      if(!team.owned.includes(d.propertyId)) team.owned.push(d.propertyId);
+      team.visited[d.propertyId] = e.ts;
+      team.lastPurchase = {name: d.propertyName, ts: e.ts};
+      if(d.prevOwner && reset[d.prevOwner]){
+        reset[d.prevOwner].owned = reset[d.prevOwner].owned.filter(id=>id!==d.propertyId);
+        reset[d.prevOwner].cash += d.amount;
+      }
+    } else if(e.type === 'meetup_fine'){
+      team.cash -= d.amount;
+    } else if(e.type === 'finalize_fine'){
+      team.cash -= d.amount;
+    } else if(e.type === 'challenge_bonus'){
+      team.cash += d.amount;
+    }
+  });
+
+  for(const name of Object.keys(reset)){
+    await saveTeam(reset[name]);
+  }
+}
+
+// ================= ACTION LOG (admin) =================
+function actionLogLine(e){
+  const d = e.detail || {};
+  switch(e.type){
+    case 'buy': return `${e.team} bought ${d.propertyName} for £${d.price}`;
+    case 'visit': return `${e.team} visited ${d.propertyName}`;
+    case 'rent': return `${e.team} paid £${d.amount} rent on ${d.propertyName} to ${d.owner}${d.boosted?' (doubled)':''}`;
+    case 'chance_cash': return `${e.team} drew "${d.text}" at ${d.locationLabel}`;
+    case 'chance_flag': return `${e.team} drew "${d.text}" at ${d.locationLabel}`;
+    case 'chance_auction_trigger': return `${e.team} triggered an auction at ${d.locationLabel}`;
+    case 'auction_won': return `${e.team} won ${d.propertyName} at auction for £${d.amount}`;
+    case 'meetup_fine': return `${e.team} fined £${d.amount} for missing the meetup`;
+    case 'finalize_fine': return `${e.team} fined £${d.amount} for not visiting ${d.propertyName}`;
+    case 'challenge_bonus': return `${e.team} awarded £${d.amount} for "${d.challengeTitle}"`;
+    default: return `${e.team||''} ${e.type}`;
+  }
+}
+async function renderActionLog(){
+  const el = document.getElementById('action-log-list');
+  if(!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try{
+    const snap = await db.ref(gamePath('/activity')).once('value');
+    if(!snap.exists()){ el.innerHTML = '<div class="empty">No actions logged yet.</div>'; return; }
+    const val = snap.val();
+    const entries = Object.keys(val).map(k=>({...val[k], logId:k})).sort((a,b)=>b.ts-a.ts);
+    const rows = entries.map(e=>{
+      const time = new Date(e.ts).toLocaleString([], {dateStyle:'short', timeStyle:'short'});
+      return `<tr>
+        <td style="font-size:10.5px; color:var(--ba-warm-grey); white-space:nowrap;">${time}</td>
+        <td>${actionLogLine(e)}</td>
+        <td><button class="btn danger" data-remove-action="${e.logId}" style="padding:4px 8px; font-size:10px;">Remove</button></td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `<div class="scroll-x"><table class="ba-table"><thead><tr><th>When</th><th>What happened</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    el.querySelectorAll('[data-remove-action]').forEach(btn=>{
+      btn.addEventListener('click', ()=>removeActionLogEntry(btn.dataset.removeAction));
+    });
+  }catch(e){ el.innerHTML = '<div class="empty">Could not load the action log.</div>'; }
+}
+async function removeActionLogEntry(logId){
+  if(!confirm('Remove this action? Every team\'s score will be recalculated from the remaining history.')) return;
+  await db.ref(gamePath('/activity/'+logId)).remove();
+  await recalculateGameFromLog();
+  renderActionLog();
+  renderTracking();
+  renderLeaderboard();
+  toast('Action removed — scores recalculated.');
+}
+document.getElementById('action-log-refresh-btn').addEventListener('click', renderActionLog);
+
+// ================= CHALLENGES =================
+document.getElementById('add-challenge-btn').addEventListener('click', async ()=>{
+  const title = document.getElementById('new-challenge-title').value.trim();
+  const desc = document.getElementById('new-challenge-desc').value.trim();
+  const bonus = parseInt(document.getElementById('new-challenge-bonus').value) || 0;
+  const statusEl = document.getElementById('add-challenge-status');
+  if(!title){ statusEl.textContent = 'Give the challenge a title.'; statusEl.className = 'status-line err'; return; }
+  const ref = db.ref(gamePath('/challenges')).push();
+  await ref.set({title, description: desc, bonus, createdAt: Date.now()});
+  document.getElementById('new-challenge-title').value = '';
+  document.getElementById('new-challenge-desc').value = '';
+  statusEl.textContent = 'Challenge added.';
+  statusEl.className = 'status-line good';
+  renderChallengesList();
+});
+async function renderChallengesList(){
+  const el = document.getElementById('challenges-list');
+  if(!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try{
+    const snap = await db.ref(gamePath('/challenges')).once('value');
+    if(!snap.exists()){ el.innerHTML = '<div class="empty">No challenges yet — add one above.</div>'; return; }
+    const val = snap.val();
+    el.innerHTML = Object.keys(val).map(cid=>{
+      const ch = val[cid];
+      return `<div class="track-row"><div class="track-name" style="flex:1;">${ch.title} <span style="color:var(--ba-warm-grey); font-weight:400;">(£${ch.bonus})</span></div><button class="btn danger" data-delete-challenge="${cid}" style="padding:4px 8px; font-size:10px;">Delete</button></div>`;
+    }).join('');
+    el.querySelectorAll('[data-delete-challenge]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        if(!confirm('Delete this challenge? Any bonuses already awarded for it stay on the team\'s score.')) return;
+        await db.ref(gamePath('/challenges/'+btn.dataset.deleteChallenge)).remove();
+        renderChallengesList();
+      });
+    });
+  }catch(e){ el.innerHTML = '<div class="empty">Could not load challenges.</div>'; }
+}
+async function renderChallengeSubmissions(){
+  const el = document.getElementById('challenge-submissions-list');
+  if(!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try{
+    const [chSnap, subSnap] = await Promise.all([
+      db.ref(gamePath('/challenges')).once('value'),
+      db.ref(gamePath('/challengeSubmissions')).once('value')
+    ]);
+    const challenges = chSnap.exists() ? chSnap.val() : {};
+    const subs = subSnap.exists() ? subSnap.val() : {};
+    let rowsHtml = '';
+    Object.keys(challenges).forEach(cid=>{
+      const ch = challenges[cid];
+      const chSubs = subs[cid] || {};
+      Object.keys(chSubs).forEach(teamKey=>{
+        const s = chSubs[teamKey];
+        if(s.status !== 'submitted') return;
+        rowsHtml += `<div class="track-row"><div class="track-name" style="flex:1;">${ch.title} — <span style="color:var(--ba-warm-grey);">${teamKey}</span> (£${ch.bonus})</div>
+          <button class="btn" data-approve-challenge="${cid}|${teamKey}" style="padding:4px 8px; font-size:10px;">Approve</button>
+          <button class="btn secondary" data-reject-challenge="${cid}|${teamKey}" style="padding:4px 8px; font-size:10px;">Reject</button></div>`;
+      });
+    });
+    el.innerHTML = rowsHtml || '<div class="empty">No pending submissions.</div>';
+    el.querySelectorAll('[data-approve-challenge]').forEach(btn=>{
+      btn.addEventListener('click', ()=>resolveChallengeSubmission(btn.dataset.approveChallenge, true));
+    });
+    el.querySelectorAll('[data-reject-challenge]').forEach(btn=>{
+      btn.addEventListener('click', ()=>resolveChallengeSubmission(btn.dataset.rejectChallenge, false));
+    });
+  }catch(e){ el.innerHTML = '<div class="empty">Could not load submissions.</div>'; }
+}
+async function resolveChallengeSubmission(key, approve){
+  const [cid, teamKey] = key.split('|');
+  const subRef = db.ref(gamePath('/challengeSubmissions/'+cid+'/'+teamKey));
+  if(approve){
+    try{
+      const chSnap = await db.ref(gamePath('/challenges/'+cid)).once('value');
+      const ch = chSnap.val();
+      const teamsData = await listTeams();
+      const team = Object.values(teamsData).find(t=>safeKey(t.name)===teamKey);
+      if(team && ch){
+        team.cash += ch.bonus;
+        await saveTeam(team);
+        await logActivity('challenge_bonus', team.name, {challengeId: cid, challengeTitle: ch.title, amount: ch.bonus});
+      }
+      await subRef.update({status:'approved', approvedAt: Date.now()});
+    }catch(e){}
+  } else {
+    await subRef.update({status:'rejected'});
+  }
+  renderChallengeSubmissions();
+  renderLeaderboard();
+}
+document.getElementById('challenge-submissions-refresh-btn').addEventListener('click', renderChallengeSubmissions);
+
+async function renderTeamChallenges(){
+  if(!currentTeam) return;
+  const el = document.getElementById('team-challenges-list');
+  const card = document.getElementById('challenges-card');
+  if(!el || !card) return;
+  try{
+    const chSnap = await db.ref(gamePath('/challenges')).once('value');
+    if(!chSnap.exists()){ card.style.display = 'none'; return; }
+    const challenges = chSnap.val();
+    const myKey = safeKey(currentTeam.name);
+    const subSnap = await db.ref(gamePath('/challengeSubmissions')).once('value');
+    const subs = subSnap.exists() ? subSnap.val() : {};
+    card.style.display = 'block';
+    el.innerHTML = Object.keys(challenges).map(cid=>{
+      const ch = challenges[cid];
+      const mySub = subs[cid] && subs[cid][myKey];
+      let actionHtml;
+      if(!mySub) actionHtml = `<button class="btn" data-submit-challenge="${cid}" style="padding:6px 10px; font-size:11px;">Mark as done</button>`;
+      else if(mySub.status==='submitted') actionHtml = `<span class="owner-tag theirs">Pending review</span>`;
+      else if(mySub.status==='approved') actionHtml = `<span class="owner-tag mine">Approved +£${ch.bonus}</span>`;
+      else actionHtml = `<span class="owner-tag theirs">Not approved</span>`;
+      return `<div class="stop"><div class="stop-body"><div class="stop-name">${ch.title}</div><div class="stop-meta">${ch.description||''} · £${ch.bonus} bonus</div></div><div class="stop-actions">${actionHtml}</div></div>`;
+    }).join('');
+    el.querySelectorAll('[data-submit-challenge]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        await db.ref(gamePath('/challengeSubmissions/'+btn.dataset.submitChallenge+'/'+myKey)).set({status:'submitted', submittedAt: Date.now()});
+        toast('Marked as done — awaiting organiser approval.');
+        renderTeamChallenges();
+      });
+    });
+  }catch(e){}
+}
+
+// ================= GROUPS: game-agnostic bulk helpers =================
+// These deliberately don't touch the app's global PROPERTIES/CARDS/config —
+// they load whatever a *specific* gameId needs, act on it, and leave the
+// currently-open game (if any) completely untouched.
+function pathPrefixFor(gameId){
+  return (gameId==='live' || gameId==='test') ? gameId : 'games/' + gameId;
+}
+async function getGameName(gameId){
+  if(gameId==='live') return 'Live (existing event)';
+  if(gameId==='test') return 'Test (existing rehearsal)';
+  try{
+    const snap = await db.ref('games/'+gameId+'/meta/name').once('value');
+    return snap.exists() ? snap.val() : gameId;
+  }catch(e){ return gameId; }
+}
+async function loadLocationsFor(gameId){
+  const snap = await db.ref(pathPrefixFor(gameId)+'/locations').once('value');
+  const val = snap.val();
+  const all = val ? (Array.isArray(val) ? val.filter(Boolean) : Object.values(val)) : [];
+  return all.filter(l=>l.type!=='special');
+}
+function rentForBulk(prop, ownerName, teamsByName, properties){
+  if(!ownerName) return prop.type==='station' ? STATION_RENT[1] : Math.round(prop.price/5);
+  const owner = teamsByName[ownerName];
+  if(!owner) return Math.round(prop.price/5);
+  if(prop.type==='station'){
+    const n = (owner.owned||[]).filter(id=>{ const p = properties.find(pp=>pp.id===id); return p && p.type==='station'; }).length;
+    return STATION_RENT[n] || STATION_RENT[4];
+  }
+  let rent = Math.round(prop.price/5);
+  const groupProps = properties.filter(p=>p.group===prop.group);
+  const ownsAll = groupProps.every(p=>(owner.owned||[]).includes(p.id));
+  if(ownsAll) rent *= 2;
+  return rent;
+}
+async function resetGameById(gameId){
+  const prefix = pathPrefixFor(gameId);
+  await db.ref(prefix+'/teams').remove();
+  await db.ref(prefix+'/activity').remove();
+  await db.ref(prefix+'/activeAuction').remove();
+  await db.ref(prefix+'/meetup').remove();
+  await db.ref(prefix+'/challengeSubmissions').remove();
+  await db.ref(prefix+'/config/finalized').set(false);
+}
+async function unlockGameById(gameId){
+  await db.ref(pathPrefixFor(gameId)+'/config/finalized').set(false);
+}
+async function finalizeGameById(gameId){
+  const prefix = pathPrefixFor(gameId);
+  const properties = await loadLocationsFor(gameId);
+  const teamsSnap = await db.ref(prefix+'/teams').once('value');
+  if(!teamsSnap.exists()) return;
+  const teamsByName = {};
+  Object.values(teamsSnap.val()).forEach(t=>{ teamsByName[t.name] = t; });
+  const owners = {};
+  Object.values(teamsByName).forEach(t=>(t.owned||[]).forEach(id=>{ owners[id] = t.name; }));
+  for(const t of Object.values(teamsByName)){
+    t.visited = t.visited || {};
+    const unvisited = properties.filter(p=>!t.visited[p.id]);
+    const fines = unvisited.map(p=>({p, fine: Math.round(1.5*rentForBulk(p, owners[p.id], teamsByName, properties))}));
+    fines.sort((a,b)=>b.fine-a.fine);
+    t.cardFlags = t.cardFlags || {};
+    let immunity = t.cardFlags.fineImmunity || 0;
+    for(const f of fines){
+      if(immunity > 0){ immunity -= 1; continue; }
+      t.cash -= f.fine;
+      await db.ref(prefix+'/activity').push({type:'finalize_fine', team:t.name, detail:{propertyId:f.p.id, propertyName:f.p.name, amount:f.fine}, ts:Date.now()});
+    }
+    t.cardFlags.fineImmunity = immunity;
+    await db.ref(prefix+'/teams/'+safeKey(t.name)).set(t);
+  }
+  await db.ref(prefix+'/config/finalized').set(true);
+}
+async function loadCombinedLeaderboard(gameIds){
+  const allTeams = [];
+  for(const gameId of gameIds){
+    const prefix = pathPrefixFor(gameId);
+    const [teamsSnap, properties, gameName] = await Promise.all([
+      db.ref(prefix+'/teams').once('value'),
+      loadLocationsFor(gameId),
+      getGameName(gameId)
+    ]);
+    if(!teamsSnap.exists()) continue;
+    Object.values(teamsSnap.val()).forEach(t=>{
+      const portfolioValue = (t.owned||[]).reduce((sum,id)=>{ const p=properties.find(pp=>pp.id===id); return sum+(p?p.price:0); },0);
+      allTeams.push({...t, gameId, gameName, netWorth:(t.cash||0)+portfolioValue});
+    });
+  }
+  allTeams.sort((a,b)=>b.netWorth-a.netWorth);
+  return allTeams;
+}
+async function ccListAllGames(){
+  const games = [];
+  try{
+    const snap = await db.ref('games').once('value');
+    if(snap.exists()){
+      const val = snap.val();
+      Object.keys(val).forEach(id=>{
+        const meta = val[id].meta;
+        if(meta) games.push({id, name: meta.name || id});
+      });
+    }
+  }catch(e){}
+  for(const legacyId of ['live','test']){
+    try{
+      const snap = await db.ref(legacyId+'/config').once('value');
+      if(snap.exists()) games.push({id: legacyId, name: legacyId==='live' ? 'Live (existing event)' : 'Test (existing rehearsal)'});
+    }catch(e){}
+  }
+  return games;
+}
+
+// ================= GROUPS: Control Centre UI =================
+let currentGroupId = null;
+document.getElementById('grp-create-btn').addEventListener('click', async ()=>{
+  const name = document.getElementById('grp-new-name').value.trim();
+  const statusEl = document.getElementById('grp-create-status');
+  if(!name){ statusEl.textContent = 'Give the group a name.'; statusEl.className = 'status-line err'; return; }
+  const id = ccGenerateGameId(name);
+  await db.ref('groups/'+id+'/meta').set({name, createdAt: Date.now()});
+  statusEl.textContent = `Group "${name}" created — add games to it below.`;
+  statusEl.className = 'status-line good';
+  document.getElementById('grp-new-name').value = '';
+  renderGroupsList();
+  renderCcStats();
+});
+document.getElementById('grp-refresh-btn').addEventListener('click', renderGroupsList);
+async function renderGroupsList(){
+  const el = document.getElementById('grp-list');
+  if(!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try{
+    const snap = await db.ref('groups').once('value');
+    if(!snap.exists()){ el.innerHTML = '<div class="empty">No groups yet — create one above.</div>'; return; }
+    const val = snap.val();
+    const rows = Object.keys(val).map(id=>{
+      const meta = val[id].meta || {};
+      const memberCount = val[id].games ? Object.keys(val[id].games).length : 0;
+      return `<div class="track-row"><div class="track-name" style="flex:1;">${meta.name||id} <span style="color:var(--ba-warm-grey); font-weight:400;">(${memberCount} game${memberCount===1?'':'s'})</span></div>
+        <button class="btn secondary" data-manage-group="${id}" data-group-name="${meta.name||id}" style="padding:4px 8px; font-size:10.5px;">Manage</button>
+        <button class="btn danger" data-delete-group="${id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
+    }).join('');
+    el.innerHTML = rows;
+    el.querySelectorAll('[data-manage-group]').forEach(btn=>{
+      btn.addEventListener('click', ()=>openGroupEditor(btn.dataset.manageGroup, btn.dataset.groupName));
+    });
+    el.querySelectorAll('[data-delete-group]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        if(!confirm('Delete this group? The games themselves are not affected.')) return;
+        await db.ref('groups/'+btn.dataset.deleteGroup).remove();
+        renderGroupsList();
+        renderCcStats();
+      });
+    });
+  }catch(e){ el.innerHTML = '<div class="empty">Could not load groups.</div>'; }
+}
+async function openGroupEditor(groupId, name){
+  currentGroupId = groupId;
+  document.getElementById('group-editor-title').textContent = 'Managing "' + name + '"';
+  document.getElementById('group-bulk-status').textContent = '';
+  document.getElementById('group-editor-modal').style.display = 'flex';
+  await populateGroupAddGameSelect();
+  await renderGroupMembers();
+  await renderGroupCombinedLeaderboard();
+}
+document.getElementById('group-editor-close-btn').addEventListener('click', ()=>{
+  document.getElementById('group-editor-modal').style.display = 'none';
+  currentGroupId = null;
+  renderGroupsList();
+});
+async function populateGroupAddGameSelect(){
+  const sel = document.getElementById('group-add-game-select');
+  sel.innerHTML = '';
+  const games = await ccListAllGames();
+  games.forEach(g=>{
+    const opt = document.createElement('option'); opt.value = g.id; opt.textContent = g.name;
+    sel.appendChild(opt);
+  });
+}
+document.getElementById('group-add-game-btn').addEventListener('click', async ()=>{
+  const gameId = document.getElementById('group-add-game-select').value;
+  if(!gameId || !currentGroupId) return;
+  await db.ref('groups/'+currentGroupId+'/games/'+gameId).set(true);
+  renderGroupMembers();
+  renderGroupCombinedLeaderboard();
+});
+async function renderGroupMembers(){
+  const el = document.getElementById('group-member-games-list');
+  if(!currentGroupId) return;
+  const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
+  if(!snap.exists()){ el.innerHTML = '<div class="empty">No games in this group yet — add one above.</div>'; return; }
+  const gameIds = Object.keys(snap.val());
+  const rows = [];
+  for(const gid of gameIds){
+    const name = await getGameName(gid);
+    rows.push(`<div class="track-row"><div class="track-name" style="flex:1;">${name}</div><button class="btn danger" data-remove-group-game="${gid}" style="padding:4px 8px; font-size:10px;">Remove</button></div>`);
+  }
+  el.innerHTML = rows.join('');
+  el.querySelectorAll('[data-remove-group-game]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      await db.ref('groups/'+currentGroupId+'/games/'+btn.dataset.removeGroupGame).remove();
+      renderGroupMembers();
+      renderGroupCombinedLeaderboard();
+    });
+  });
+}
+async function renderGroupCombinedLeaderboard(){
+  const el = document.getElementById('group-combined-leaderboard');
+  if(!currentGroupId) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
+  const gameIds = snap.exists() ? Object.keys(snap.val()) : [];
+  if(gameIds.length === 0){ el.innerHTML = '<div class="empty">Add games above to see a combined leaderboard.</div>'; return; }
+  const teams = await loadCombinedLeaderboard(gameIds);
+  if(teams.length === 0){ el.innerHTML = '<div class="empty">No teams registered in any member game yet.</div>'; return; }
+  const rows = teams.map((t,i)=>`<tr>
+    <td class="ba-rank-cell ${i===0?'gold':''}">${i+1}</td>
+    <td><strong>${t.icon?t.icon+' ':''}${t.name}</strong></td>
+    <td style="font-size:10.5px; color:var(--ba-warm-grey);">${t.gameName}</td>
+    <td style="font-weight:800; color:var(--ba-blue-corp);">£${t.netWorth}</td>
+  </tr>`).join('');
+  el.innerHTML = `<div class="scroll-x"><table class="ba-table"><thead><tr><th></th><th>Team</th><th>Game</th><th>Net worth</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+document.getElementById('group-unlock-all-btn').addEventListener('click', async ()=>{
+  if(!currentGroupId) return;
+  const statusEl = document.getElementById('group-bulk-status');
+  const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
+  const gameIds = snap.exists() ? Object.keys(snap.val()) : [];
+  for(const gid of gameIds){ await unlockGameById(gid); }
+  statusEl.textContent = 'All games in this group re-opened.';
+  statusEl.className = 'status-line good';
+});
+document.getElementById('group-reset-all-btn').addEventListener('click', async ()=>{
+  if(!currentGroupId) return;
+  if(!confirm('Reset every team in every game in this group? This cannot be undone.')) return;
+  const statusEl = document.getElementById('group-bulk-status');
+  statusEl.textContent = 'Resetting…';
+  statusEl.className = 'status-line warn';
+  const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
+  const gameIds = snap.exists() ? Object.keys(snap.val()) : [];
+  for(const gid of gameIds){ await resetGameById(gid); }
+  statusEl.textContent = 'All games in this group reset.';
+  statusEl.className = 'status-line good';
+  renderGroupCombinedLeaderboard();
+});
+document.getElementById('group-finalize-all-btn').addEventListener('click', async ()=>{
+  if(!currentGroupId) return;
+  if(!confirm('Finalise every game in this group and apply fines? This locks all of them.')) return;
+  const statusEl = document.getElementById('group-bulk-status');
+  statusEl.textContent = 'Finalising…';
+  statusEl.className = 'status-line warn';
+  const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
+  const gameIds = snap.exists() ? Object.keys(snap.val()) : [];
+  for(const gid of gameIds){ await finalizeGameById(gid); }
+  statusEl.textContent = 'All games in this group finalised.';
+  statusEl.className = 'status-line good';
+  renderGroupCombinedLeaderboard();
+});
+
 async function bootstrap(){
   if(!currentGameId){
     document.getElementById('control-centre').style.display = 'block';

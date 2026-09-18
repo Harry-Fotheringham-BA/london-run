@@ -44,7 +44,7 @@
     display:flex; align-items:center; gap:14px;
     height:52px; padding:0 16px;
     background:var(--ba-blue-dark); border-bottom:3px solid var(--ba-blue-corp);
-    position:sticky; top:0; z-index:100;
+    position:sticky; top:0; z-index:1000;
   }
   .topnav-left{display:flex; flex-direction:column; justify-content:center; flex-shrink:0;}
   .topnav-word{font-weight:800; font-size:13px; letter-spacing:0.06em; color:var(--white); text-transform:uppercase; line-height:1.1;}
@@ -62,7 +62,7 @@
   }
   .live-dot{width:7px; height:7px; border-radius:50%; background:var(--rag-green-accent); animation:livepulse 2s infinite; flex-shrink:0;}
   @keyframes livepulse{0%{box-shadow:0 0 0 0 rgba(30,125,74,0.6);} 70%{box-shadow:0 0 0 6px rgba(30,125,74,0);} 100%{box-shadow:0 0 0 0 rgba(30,125,74,0);}}
-  #env-badge.topnav-badge{background:var(--ba-red); color:var(--white); font-weight:800; font-size:10px; padding:3px 8px; border-radius:4px; letter-spacing:0.04em;}
+  .topnav-badge{background:var(--ba-red); color:var(--white); font-weight:800; font-size:10px; padding:3px 8px; border-radius:4px; letter-spacing:0.04em;}
   .topnav-burger{display:none; width:28px; height:28px; border-radius:4px; border:1px solid rgba(255,255,255,0.35); background:transparent; color:var(--white); font-size:15px; cursor:pointer;}
   @media (max-width:768px){
     .topnav nav.tabs{
@@ -187,7 +187,7 @@
   .lock-banner{background:var(--rag-red-bg); color:var(--rag-red-text); border:1px solid var(--rag-red-border); padding:8px 12px; border-radius:6px; font-size:11.5px; font-weight:700; margin-bottom:12px; text-align:center;}
   .small-note{font-size:11px; color:var(--ba-warm-grey); line-height:1.5; margin-top:6px;}
 
-  #leaflet-map, #player-map{height:320px; width:100%; border-radius:6px; border:1px solid #ddd;}
+  #leaflet-map, #player-map{height:320px; width:100%; border-radius:6px; border:1px solid #ddd; position:relative; z-index:0; isolation:isolate;}
   .leaflet-tooltip.team-label{background:var(--ba-blue-dark); color:var(--white); border:none; font-weight:700; font-size:10px; padding:3px 7px; border-radius:4px;}
   .leaflet-tooltip.team-label::before{display:none;}
 
@@ -220,14 +220,21 @@
     .play-top-row .card{margin-bottom:0;}
     .compass-widget{margin-bottom:0; height:100%;}
     .group-grid{grid-template-columns:1fr 1fr;}
-    #admin-panel{display:grid; grid-template-columns:1fr 1fr; gap:14px; align-items:start;}
-    #admin-panel .card{margin-bottom:0;}
-    #admin-panel .card.full-width{grid-column:1 / -1;}
+    .admin-subpanel{display:grid; grid-template-columns:1fr 1fr; gap:14px; align-items:start;}
+    .admin-subpanel .card{margin-bottom:0;}
+    .admin-subpanel .card.full-width{grid-column:1 / -1;}
     .role-btn-row{flex-direction:row;}
     .role-btn{flex:1;}
   }
 
   /* ===== Print ===== */
+  /* ===== Shared Location Editor modal ===== */
+  .loc-editor-modal{position:fixed; inset:0; background:rgba(2,27,65,0.65); z-index:2000; display:flex; align-items:flex-start; justify-content:center; padding:20px 16px; overflow-y:auto;}
+  .loc-editor-inner{background:var(--white); border-radius:8px; max-width:720px; width:100%; padding:18px 20px; margin:10px 0 40px;}
+  .loc-editor-header{display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;}
+  .loc-editor-title{font-weight:800; font-size:15px; color:var(--navy);}
+  #loc-editor-map{height:360px; width:100%; border-radius:6px; border:1px solid #ddd; position:relative; z-index:0; isolation:isolate; margin-top:8px;}
+
   @media print{
     .topnav, .no-print, .btn, .btn-row{display:none !important;}
     body{background:#fff; color:#000;}
