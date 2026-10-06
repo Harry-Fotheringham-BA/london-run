@@ -65,7 +65,7 @@ const DEFAULT_CARDS = [
   {text:"Landing Rights Auction \u2014 a sealed-bid auction just opened for a random property!", type:'auction'},
 ];
 const STATION_RENT = {1:25, 2:50, 3:100, 4:200};
-const DEFAULT_CONFIG = {startMoney:1500, geofenceRadius:250, eventEnd:null, adminPasscode:'LONDON26', finalized:false, coordOverrides:{}, startPoint:{lat:51.5080, lng:-0.1281}};
+const DEFAULT_CONFIG = {startMoney:1500, geofenceRadius:60, eventEnd:null, adminPasscode:'LONDON26', finalized:false, coordOverrides:{}, startPoint:{lat:51.5080, lng:-0.1281}, showTeamLocations:false, organiserContact:'', cardMode:'location', cardPrice:50};
 const ICON_OPTIONS = ['\ud83e\udd8a','\ud83e\udd81','\ud83d\udc27','\ud83d\ude80','\u26a1','\ud83c\udfa9','\ud83e\udd85','\ud83d\udc1d','\ud83c\udfaf','\ud83c\udf40','\ud83d\udc51','\ud83d\udd25','\ud83d\udc33','\ud83c\udf88','\ud83d\udef8','\ud83c\udf1f'];
 
 // These four are now per-game runtime data, loaded by loadGameData().
@@ -83,8 +83,12 @@ function applyLocations(locations){
   PROPERTIES.forEach(p=>{ if(!seen.includes(p.group)) seen.push(p.group); });
   GROUP_ORDER = seen;
 }
+function isLegacyGame(id){ return id==='live' || id==='test'; }
 async function loadGameData(){
-  applyLocations(MONOPOLY_TEMPLATE_LOCATIONS.map(l=>({...l})));
+  // Only the legacy single-game boards (live/test) fall back to Monopoly — a game created
+  // as "Blank" legitimately has no locations yet and must stay empty.
+  const legacy = isLegacyGame(currentGameId);
+  applyLocations(legacy ? MONOPOLY_TEMPLATE_LOCATIONS.map(l=>({...l})) : []);
   CARDS = DEFAULT_CARDS.map((c,i)=>({...c, id:'d'+i}));
   if(!currentGameId) return;
   try{
@@ -92,8 +96,8 @@ async function loadGameData(){
     if(locSnap.exists()){
       const val = locSnap.val();
       const locations = Array.isArray(val) ? val.filter(Boolean) : Object.values(val);
-      if(locations.length) applyLocations(locations);
-    } else {
+      applyLocations(locations);
+    } else if(legacy){
       // Lazy-seed so this game has its own persisted copy going forward.
       const seedLocs = {};
       PROPERTIES.concat(SPECIALS).forEach(l=>{ seedLocs[l.id] = l; });
@@ -129,8 +133,21 @@ let selectedMapId = null;
 let sortMode = 'group';
 let activeAuctionListener = null;
 let auctionTimerInterval = null;
-let playerMap = null, playerMarkersLayer = null, playerMeMarker = null;
+let playerMap = null, playerMarkersLayer = null, playerMeMarker = null, playerMapCentred = false;
+let adminLiveMap = null, adminLiveLayer = null;
 const photoCache = {};
+// Live session state. A team phone keeps a listener on /teams so its own record (and everyone
+// else's ownership) is always current — it never writes a whole team record back.
+let myTeamKey = null;
+let teamsCache = {};
+let sessionListeners = [];      // [{ref, event, cb}] detached on switch-role
+let gpsWatchId = null;
+let wakeLock = null;
+let hasAbsoluteHeading = false;
+const openInfo = new Set();     // stop ids whose info panel is expanded
+const busyActions = new Set();  // action keys in flight — blocks double taps
+let latestAuction = null;
+let positionsCache = {};       // other teams' last pings (team role), shown only if allowed
 
 // ================= HELPERS =================
 function haversine(lat1,lon1,lat2,lon2){
@@ -148,16 +165,82 @@ function bearing(lat1,lon1,lat2,lon2){
 function fmtDist(m){ if(m==null) return '—'; return m<1000 ? Math.round(m)+' m' : (m/1000).toFixed(1)+' km'; }
 function fmtAgo(ts){ if(!ts) return 'never'; const s=Math.round((Date.now()-ts)/1000); if(s<60) return s+'s ago'; if(s<3600) return Math.round(s/60)+'m ago'; return Math.round(s/3600)+'h ago'; }
 function baseRent(prop){ return Math.round(prop.price/5); }
+// Teams are allowed to go below £0 (rent, cards and fines are never blocked); show it as -£152.
+function fmtMoney(n){ n = Math.round(n||0); return (n < 0 ? '-£' : '£') + Math.abs(n); }
+function moneyHtml(n){ return `<span class="${(n||0) < 0 ? 'money-neg' : ''}">${fmtMoney(n)}</span>`; }
 function getLatLng(item){
   const o = config.coordOverrides && config.coordOverrides[item.id];
   return o ? o : {lat:item.lat, lng:item.lng};
 }
+// Escape anything user- or organiser-supplied before it goes into innerHTML.
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function inc(n){ return firebase.database.ServerValue.increment(n); }
+function teamPath(name, sub){ return gamePath('/teams/' + safeKey(name) + (sub ? '/' + sub : '')); }
+// `owned` used to be an array; it is now a map {propId:true} so single properties can be
+// added/removed without rewriting the list. Reads accept either shape (or a mix of both).
+function ownedIds(t){
+  const o = t && t.owned;
+  if(!o) return [];
+  if(Array.isArray(o)) return o.filter(Boolean);
+  return Object.keys(o).filter(k=>o[k]).map(k=>typeof o[k]==='string' ? o[k] : k);
+}
+function toOwnedMap(val){
+  const m = {};
+  ownedIds({owned:val}).forEach(id=>{ m[id] = true; });
+  return m;
+}
+async function addOwned(teamName, propId){
+  await db.ref(teamPath(teamName, 'owned')).transaction(cur=>{ const m = toOwnedMap(cur); m[propId] = true; return m; });
+}
+async function removeOwned(teamName, propId){
+  await db.ref(teamPath(teamName, 'owned')).transaction(cur=>{ const m = toOwnedMap(cur); delete m[propId]; return m; });
+}
+// Teams can only act while the game is running: after the organiser presses Start game, and
+// before it's finalised or the event end time passes. A game with no `started` flag counts as
+// not started.
+function eventEndTs(){ return config.eventEnd ? new Date(config.eventEnd).getTime() : null; }
+function gameLockReason(){
+  if(config.finalized) return 'finalized';
+  const end = eventEndTs();
+  if(end != null && !isNaN(end) && Date.now() >= end) return 'ended';
+  if(!config.started) return config.startedAt ? 'paused' : 'not-started';
+  return null;
+}
+function isGameLocked(){ return gameLockReason() !== null; }
+function lockedMessage(){
+  switch(gameLockReason()){
+    case 'not-started': return 'The game hasn\'t started yet. Wait for the organiser to press Start — you can look around, but nothing counts until then.';
+    case 'paused': return 'The organiser has paused the game. Nothing can be bought, paid or drawn until it restarts.';
+    case 'finalized': return 'The game has been finalised — the board is locked.';
+    case 'ended': return 'Time\'s up — the board is locked. Head back to the start!';
+    default: return '';
+  }
+}
+function lockedButtonLabel(){
+  const r = gameLockReason();
+  return r === 'not-started' ? 'NOT STARTED' : r === 'paused' ? 'PAUSED' : 'ENDED';
+}
+// Distance to a stop plus whether this phone may check in there. A check-in also needs GPS
+// accuracy at least as good as the radius, otherwise a ±100m fix could "reach" several stops.
+function proximity(item){
+  if(!currentPosition) return {dist:null, inRange:false, weak:false};
+  const c = getLatLng(item);
+  const dist = haversine(currentPosition.latitude, currentPosition.longitude, c.lat, c.lng);
+  const radius = config.geofenceRadius;
+  const near = dist <= radius;
+  const weak = near && currentPosition.accuracy > radius;
+  return {dist, inRange: near && !weak, weak};
+}
 function toast(msg, isCard){
+  const stack = document.getElementById('toast-stack');
   const el = document.createElement('div');
   el.className = 'toast' + (isCard ? ' card' : '');
   el.textContent = msg;
-  document.getElementById('toast-stack').appendChild(el);
-  setTimeout(()=>el.remove(), 5000);
+  el.title = 'Tap to dismiss';
+  el.addEventListener('click', ()=>el.remove());
+  stack.appendChild(el);
+  while(stack.children.length > 3) stack.firstChild.remove();
+  setTimeout(()=>el.remove(), isCard ? 8000 : 5000);
 }
 function notify(title, body){
   toast(title + ' — ' + body);
@@ -180,17 +263,100 @@ async function loadTeam(name){
     return snap.exists() ? snap.val() : null;
   }catch(e){ return null; }
 }
-async function saveTeam(team){ await db.ref(gamePath('/teams/')+safeKey(team.name)).set(team); }
+// Whole-record write — only for creating a brand-new team. Everything else writes just the
+// fields it changes so it can't clobber updates made by other devices.
+async function saveTeam(team){
+  await db.ref(gamePath('/teams/')+safeKey(team.name)).set(team);
+}
+// Renames a team and carries every reference to it (activity log, challenge submissions,
+// meetup fines, live auction bids, position, ownership) across to the new name, in one
+// atomic update so no device sees a half-renamed state. A signed-in phone follows the
+// rename by matching its token.
+async function renameTeam(oldName, newName){
+  const oldKey = safeKey(oldName), newKey = safeKey(newName);
+  const updates = {};
+  const teamSnap = await db.ref(gamePath('/teams/'+oldKey)).once('value');
+  const team = teamSnap.val();
+  if(!team) return;
+  if(oldKey !== newKey) updates['teams/'+newKey] = {...team, name:newName};
+  else updates['teams/'+oldKey+'/name'] = newName;
+  ownedIds(team).forEach(pid=>{ updates['ownership/'+pid] = newName; });
+  const actSnap = await db.ref(gamePath('/activity')).once('value');
+  if(actSnap.exists()){
+    const val = actSnap.val();
+    Object.keys(val).forEach(id=>{
+      const e = val[id];
+      if(e.team === oldName) updates['activity/'+id+'/team'] = newName;
+      if(e.detail && e.detail.owner === oldName) updates['activity/'+id+'/detail/owner'] = newName;
+      if(e.detail && e.detail.prevOwner === oldName) updates['activity/'+id+'/detail/prevOwner'] = newName;
+    });
+  }
+  const auctionSnap = await db.ref(gamePath('/activeAuction')).once('value');
+  if(auctionSnap.exists()){
+    const a = auctionSnap.val();
+    if(a.ownerAtStart === oldName) updates['activeAuction/ownerAtStart'] = newName;
+    if(oldKey !== newKey && a.bids && a.bids[oldKey] !== undefined){
+      updates['activeAuction/bids/'+newKey] = a.bids[oldKey];
+      updates['activeAuction/bids/'+oldKey] = null;
+    }
+  }
+  if(oldKey !== newKey){
+    const subSnap = await db.ref(gamePath('/challengeSubmissions')).once('value');
+    if(subSnap.exists()){
+      const val = subSnap.val();
+      Object.keys(val).forEach(cid=>{
+        if(val[cid] && val[cid][oldKey] !== undefined){
+          updates['challengeSubmissions/'+cid+'/'+newKey] = val[cid][oldKey];
+          updates['challengeSubmissions/'+cid+'/'+oldKey] = null;
+        }
+      });
+    }
+    const fineSnap = await db.ref(gamePath('/meetup/teamFineState/'+oldKey)).once('value');
+    if(fineSnap.exists()){
+      updates['meetup/teamFineState/'+newKey] = fineSnap.val();
+      updates['meetup/teamFineState/'+oldKey] = null;
+    }
+    const posSnap = await db.ref(gamePath('/positions/'+oldKey)).once('value');
+    if(posSnap.exists()){
+      updates['positions/'+newKey] = posSnap.val();
+      updates['positions/'+oldKey] = null;
+    }
+    updates['teams/'+oldKey] = null;
+  }
+  await db.ref(gamePath('')).update(updates);
+}
+// Teams keyed by name. Each team's lastLocation comes from /positions (written by its phone),
+// falling back to the legacy field on the team record.
 async function listTeams(){
   const out = {};
   try{
-    const snap = await db.ref(gamePath('/teams')).once('value');
+    const [snap, posSnap] = await Promise.all([
+      db.ref(gamePath('/teams')).once('value'),
+      db.ref(gamePath('/positions')).once('value')
+    ]);
+    const positions = posSnap.val() || {};
     if(snap.exists()){
       const val = snap.val();
-      Object.keys(val).forEach(k=>{ const t = val[k]; if(t && t.name) out[t.name] = t; });
+      Object.keys(val).forEach(k=>{ const t = val[k]; if(t && t.name) out[t.name] = {...t, lastLocation: positions[k] || t.lastLocation || null}; });
     }
   }catch(e){}
   return out;
+}
+// /ownership/{propId} = owning team's name. It's the lock a purchase claims with a transaction,
+// so two teams buying at the same moment can't both win. Rebuilt from the team records after
+// any bulk change (reset, recalculation).
+async function rebuildOwnershipIndex(prefix){
+  prefix = prefix || gamePath('');
+  const snap = await db.ref(prefix+'/teams').once('value');
+  const idx = {};
+  Object.values(snap.val() || {}).forEach(t=>{ if(t && t.name) ownedIds(t).forEach(pid=>{ idx[pid] = t.name; }); });
+  await db.ref(prefix+'/ownership').set(idx);
+}
+async function ensureOwnershipIndex(){
+  try{
+    const snap = await db.ref(gamePath('/ownership')).once('value');
+    if(!snap.exists()) await rebuildOwnershipIndex();
+  }catch(e){}
 }
 function getDeviceId(){
   try{
@@ -202,7 +368,7 @@ function getDeviceId(){
 async function claimDeviceForTeam(team){
   const myId = getDeviceId();
   if(team.lockedDeviceId && team.lockedDeviceId !== myId) return {ok:false};
-  if(!team.lockedDeviceId){ team.lockedDeviceId = myId; await saveTeam(team); }
+  if(!team.lockedDeviceId){ team.lockedDeviceId = myId; await db.ref(teamPath(team.name, 'lockedDeviceId')).set(myId); }
   return {ok:true};
 }
 function populateIconSelect(selectEl, current){
@@ -218,20 +384,31 @@ function populateIconSelect(selectEl, current){
 async function logActivity(type, teamName, detail){
   try{ await db.ref(gamePath('/activity')).push({type, team: teamName, detail: detail||{}, ts: Date.now()}); }catch(e){}
 }
+// Public feed wording. Returns plain text — callers escape it.
+function activityText(entry){
+  const d = entry.detail || {};
+  const team = entry.team || '';
+  switch(entry.type){
+    case 'buy': return `${team} bought ${d.propertyName}`;
+    case 'visit': return `${team} visited ${d.propertyName}`;
+    case 'rent': return `${team} paid rent on ${d.propertyName} to ${d.owner}`;
+    case 'chance_cash': case 'chance_flag': case 'chance_auction_trigger': return d.bought ? `${team} bought a Chance card` : `${team} drew a card at ${d.locationLabel}`;
+    case 'auction_won': return `${team} won ${d.propertyName} at auction for £${d.amount}`;
+    case 'meetup_fine': return `${team} fined £${d.amount} for missing the meetup deadline`;
+    case 'finalize_fine': return `${team} fined £${d.amount} for not visiting ${d.propertyName}`;
+    case 'fine_immunity_used': return `${team} used ${d.count} Fast Track card(s) to skip fines`;
+    case 'challenge_bonus': return `${team} awarded £${d.amount} for "${d.challengeTitle}"`;
+    case 'admin_cash': return `Organiser adjusted ${team}'s cash by ${d.delta>=0?'+':'-'}£${Math.abs(d.delta)}`;
+    case 'team_reset': return `Organiser reset ${team}'s progress`;
+    case 'game_started': return 'The game has started — go!';
+    case 'game_paused': return 'The organiser paused the game';
+    case 'game_resumed': return 'The game has resumed';
+    default: return `${team} ${entry.type}`;
+  }
+}
 function activityLine(entry){
   const time = new Date(entry.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-  let text = '';
-  const d = entry.detail || {};
-  if(entry.type==='buy') text = `${entry.team} bought ${d.propertyName}`;
-  else if(entry.type==='visit') text = `${entry.team} visited ${d.propertyName}`;
-  else if(entry.type==='rent') text = `${entry.team} paid rent on ${d.propertyName} to ${d.owner}`;
-  else if(entry.type==='chance_cash' || entry.type==='chance_flag' || entry.type==='chance_auction_trigger') text = `${entry.team} drew a card at ${d.locationLabel}`;
-  else if(entry.type==='auction_won') text = `${entry.team} won ${d.propertyName} at auction for £${d.amount}`;
-  else if(entry.type==='meetup_fine') text = `${entry.team} fined £${d.amount} for missing the meetup deadline`;
-  else if(entry.type==='finalize_fine') text = `${entry.team} fined £${d.amount} for not visiting ${d.propertyName}`;
-  else if(entry.type==='challenge_bonus') text = `${entry.team} awarded £${d.amount} for "${d.challengeTitle}"`;
-  else text = `${entry.team||''} ${entry.type}`;
-  return `<div class="activity-row">${text}<div class="at">${time}</div></div>`;
+  return `<div class="activity-row">${esc(activityText(entry))}<div class="at">${time}</div></div>`;
 }
 async function renderActivityFeed(elId, limit){
   const el = document.getElementById(elId);
@@ -263,42 +440,51 @@ async function renderOwnPropertyActivity(){
 async function saveSnapshot(){
   const teamsData = await listTeams();
   const standings = Object.values(teamsData).map(t=>{
-    const portfolioValue = (t.owned||[]).reduce((sum,id)=>{const p=PROPERTIES.find(pp=>pp.id===id); return sum+(p?p.price:0);},0);
-    return {name:t.name, cash:t.cash||0, netWorth:(t.cash||0)+portfolioValue, owned:(t.owned||[]).length};
+    const portfolioValue = ownedIds(t).reduce((sum,id)=>{const p=PROPERTIES.find(pp=>pp.id===id); return sum+(p?p.price:0);},0);
+    return {name:t.name, cash:t.cash||0, netWorth:(t.cash||0)+portfolioValue, owned:ownedIds(t).length};
   });
   await db.ref(gamePath('/snapshots')).push({ts:Date.now(), standings});
 }
+// Nearest stop still worth walking to: not visited/drawn, and not the one you're already
+// standing on (that one is in the "You're here" card instead).
 function getNearestRemaining(){
   if(!currentTeam || !currentPosition) return null;
   const remaining = PROPERTIES.filter(p=>!(currentTeam.visited && currentTeam.visited[p.id]))
-    .concat(SPECIALS.filter(s=>!(currentTeam.specialDraws && currentTeam.specialDraws[s.id])));
-  if(remaining.length===0) return null;
+    .concat(activeSpecials().filter(s=>!(currentTeam.specialDraws && currentTeam.specialDraws[s.id])));
   let nearest=null, nd=Infinity;
   remaining.forEach(p=>{
-    const c = getLatLng(p);
-    const d = haversine(currentPosition.latitude, currentPosition.longitude, c.lat, c.lng);
+    const d = proximity(p).dist;
+    if(d <= config.geofenceRadius) return;
     if(d<nd){ nd=d; nearest=p; }
   });
-  return nearest;
+  return nearest ? {stop:nearest, dist:nd} : null;
 }
 function ownershipMap(teamsData){
   const map = {};
-  Object.values(teamsData).forEach(t=>(t.owned||[]).forEach(pid=>{ map[pid] = t.name; }));
+  Object.values(teamsData).forEach(t=>ownedIds(t).forEach(pid=>{ map[pid] = t.name; }));
   return map;
 }
 function currentRent(prop, ownerName, teamsData){
   if(!ownerName) return prop.type==='station' ? STATION_RENT[1] : baseRent(prop);
   const owner = teamsData[ownerName];
   if(!owner) return baseRent(prop);
+  const owned = ownedIds(owner);
   if(prop.type==='station'){
-    const n = (owner.owned||[]).filter(id=>PROPERTIES.find(p=>p.id===id)?.type==='station').length;
+    const n = owned.filter(id=>PROPERTIES.find(p=>p.id===id)?.type==='station').length;
     return STATION_RENT[n] || STATION_RENT[4];
   }
   let rent = baseRent(prop);
   const groupProps = PROPERTIES.filter(p=>p.group===prop.group);
-  const ownsAll = groupProps.every(p=>(owner.owned||[]).includes(p.id));
+  const ownsAll = groupProps.every(p=>owned.includes(p.id));
   if(ownsAll) rent *= 2;
   return rent;
+}
+// What a visitor would pay right now, including the owner's Rent Boost card if they hold one.
+function rentDue(prop, ownerName, teamsData){
+  const rent = currentRent(prop, ownerName, teamsData);
+  const owner = ownerName && teamsData[ownerName];
+  const boosted = !!(owner && owner.cardFlags && owner.cardFlags.rentBoost > 0);
+  return {rent: boosted ? rent*2 : rent, boosted};
 }
 
 // ================= ROLE GATE =================
@@ -341,6 +527,7 @@ document.getElementById('gate-team-enter-btn').addEventListener('click', async (
   const claim = await claimDeviceForTeam(team);
   if(!claim.ok){ statusEl.textContent = 'This team is already signed in on another device. Ask your organiser to unlock it.'; statusEl.className='status-line err'; return; }
   currentTeam = team;
+  myTeamKey = safeKey(team.name);
   enterApp('team');
 });
 document.getElementById('gate-admin-enter-btn').addEventListener('click', async ()=>{
@@ -350,8 +537,32 @@ document.getElementById('gate-admin-enter-btn').addEventListener('click', async 
   adminUnlocked = true;
   enterApp('admin');
 });
+function listen(path, cb){
+  const ref = db.ref(gamePath(path));
+  ref.on('value', cb);
+  sessionListeners.push({ref, cb});
+}
+// Same as listen() but for a query (e.g. the last few activity entries).
+function listenQuery(query, cb){
+  query.on('value', cb);
+  sessionListeners.push({ref: query, cb});
+}
+function teardownSession(){
+  endTour(false);
+  if(typeof closeBigScreen === 'function' && bigScreenOn) closeBigScreen();
+  bigScreenWired = false;
+  positionsCache = {};
+  sessionListeners.forEach(({ref, cb})=>ref.off('value', cb));
+  sessionListeners = [];
+  activeAuctionListener = null;
+  if(auctionTimerInterval){ clearInterval(auctionTimerInterval); auctionTimerInterval = null; }
+  if(gpsWatchId != null && navigator.geolocation){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; }
+  if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
+  teamsCache = {}; myTeamKey = null; latestAuction = null;
+  notifiedIds = new Set(); playerMapCentred = false;
+}
 document.getElementById('switch-role-btn').addEventListener('click', ()=>{
-  if(activeAuctionListener){ db.ref(gamePath('/activeAuction')).off('value', activeAuctionListener); activeAuctionListener = null; }
+  teardownSession();
   currentTeam = null; currentRole = null; adminUnlocked = false;
   document.getElementById('app-main').style.display = 'none';
   document.getElementById('role-gate').style.display = 'block';
@@ -361,7 +572,7 @@ document.getElementById('switch-role-btn').addEventListener('click', ()=>{
 });
 
 function configureNavForRole(role){
-  const map = { team:['play','board','leaderboard'], admin:['admin','board','leaderboard'], spectator:['leaderboard'] };
+  const map = { team:['play','board','leaderboard','help'], admin:['admin','board','leaderboard','help'], spectator:['leaderboard','help'] };
   const allowed = map[role] || [];
   document.querySelectorAll('nav.tabs button').forEach(btn=>{
     btn.style.display = allowed.includes(btn.dataset.view) ? '' : 'none';
@@ -372,7 +583,9 @@ function switchView(viewName){
   document.querySelectorAll('section.view').forEach(v=>v.classList.toggle('active', v.id==='view-'+viewName));
   if(viewName==='leaderboard') renderLeaderboard();
   if(viewName==='board') renderBoardOverview();
+  if(viewName==='help') renderHelp();
   if(viewName==='admin' && currentRole==='admin'){ renderTracking(); }
+  if(viewName==='play' && playerMap) setTimeout(()=>playerMap.invalidateSize(), 60);
 }
 document.querySelectorAll('nav.tabs button').forEach(btn=>{
   btn.addEventListener('click', ()=>{
@@ -395,18 +608,15 @@ document.querySelectorAll('#admin-subnav button').forEach(btn=>{
       const teamsData = await listTeams();
       renderTeamMarkersOnMap(teamsData);
     }
+    if(btn.dataset.adminTab === 'play'){
+      ensureAdminLiveMap();
+      renderTracking();
+    }
     if(btn.dataset.adminTab === 'log'){
       renderActionLog();
     }
   });
 });
-const topnavBurger = document.getElementById('topnav-burger');
-if(topnavBurger){
-  topnavBurger.addEventListener('click', ()=>{
-    const navEl = document.querySelector('nav.tabs');
-    if(navEl) navEl.classList.toggle('mobile-open');
-  });
-}
 
 async function enterApp(role){
   currentRole = role;
@@ -417,37 +627,64 @@ async function enterApp(role){
   const envBadge = document.getElementById('env-badge');
   if(envBadge){ envBadge.textContent = currentGameName || currentGameId; envBadge.style.display = 'inline-block'; }
   const subtitles = {
-    team: `Playing as "${currentTeam ? (currentTeam.icon?currentTeam.icon+' ':'') + currentTeam.name : ''}".`,
     admin: 'Organiser view — setup, safety tracking, and results.',
     spectator: 'Following along live — leaderboard only.'
   };
   document.getElementById('role-subtitle').textContent = subtitles[role] || '';
+  // Every role follows config live, so finalise / end time / radius changes reach phones immediately.
+  listen('/config', snap=>{
+    config = snap.exists() ? {...DEFAULT_CONFIG, ...snap.val()} : {...DEFAULT_CONFIG};
+    if(currentRole==='team'){ renderEventClock(); scheduleTeamRender(); }
+    if(currentRole==='admin') renderGameStatus();
+  });
   if(role==='team'){
-    refreshWallet();
-    renderSpecials();
-    renderStops();
+    myTeamKey = safeKey(currentTeam.name);
+    updateTeamIdentity();
+    await migrateOwnedShape(currentTeam.name);
+    await ensureOwnershipIndex();
+    listen('/teams', onTeamsSnapshot);
+    listen('/locations', snap=>{
+      const val = snap.val();
+      applyLocations(val ? (Array.isArray(val) ? val.filter(Boolean) : Object.values(val)) : []);
+      scheduleTeamRender();
+    });
+    // Other teams' positions — only drawn when the organiser allows it for this game.
+    listen('/positions', snap=>{ positionsCache = snap.val() || {}; if(config.showTeamLocations) scheduleTeamRender(); });
     startGPS();
+    requestWakeLock();
     renderOwnPropertyActivity();
     renderTeamChallenges();
-    if(activeAuctionListener) db.ref(gamePath('/activeAuction')).off('value', activeAuctionListener);
-    activeAuctionListener = (snap)=>renderAuctionUI(snap.val());
-    db.ref(gamePath('/activeAuction')).on('value', activeAuctionListener);
+    activeAuctionListener = (snap)=>{ latestAuction = snap.val(); renderAuctionUI(latestAuction); };
+    listen('/activeAuction', activeAuctionListener);
     checkMeetupFine();
     switchView('play');
+    maybeStartTour('team');
   } else if(role==='admin'){
+    migrateCoordOverrides();
+    ensureOwnershipIndex();
+    // The organiser's screen also settles auctions, so one closes even if no team has the app open.
+    listen('/activeAuction', snap=>{ latestAuction = snap.val(); });
     document.getElementById('cfg-startmoney').value = config.startMoney;
     document.getElementById('cfg-radius').value = config.geofenceRadius;
     document.getElementById('cfg-end').value = config.eventEnd || '';
     document.getElementById('cfg-passcode').value = config.adminPasscode;
-    document.getElementById('cfg-start-lat').value = config.startPoint ? config.startPoint.lat : DEFAULT_CONFIG.startPoint.lat;
-    document.getElementById('cfg-start-lng').value = config.startPoint ? config.startPoint.lng : DEFAULT_CONFIG.startPoint.lng;
+    document.getElementById('cfg-show-locations').checked = !!config.showTeamLocations;
+    document.getElementById('cfg-contact').value = config.organiserContact || '';
+    document.getElementById('cfg-game-name').value = currentGameName || '';
+    document.getElementById('cfg-card-mode').value = config.cardMode || 'location';
+    document.getElementById('cfg-card-price').value = config.cardPrice != null ? config.cardPrice : DEFAULT_CONFIG.cardPrice;
+    fillBigScreenLink();
+    renderGameStatus();
+    loadMeetupPlanIntoForm();
     populateIconSelect(document.getElementById('new-team-icon'), null);
     renderTeamLinks();
     populateManageTeamSelect();
     renderCardsManager();
     switchView('admin');
+    maybeStartTour('admin');
   } else {
     switchView('leaderboard');
+    maybeStartTour('spectator');
   }
 }
 
@@ -465,19 +702,89 @@ document.getElementById('compass-perm-btn').addEventListener('click', async ()=>
     }catch(e){ toast('Compass permission request failed.'); }
   } else { toast('Compass should already be active on this device.'); }
 });
+// Prefer a north-referenced heading: iOS gives webkitCompassHeading; Android gives it via
+// deviceorientationabsolute. A plain (relative) deviceorientation alpha is NOT north-based, so
+// once an absolute source has been seen the relative events are ignored, and on their own they
+// are never used.
 window.addEventListener('deviceorientationabsolute', handleOrientation);
 window.addEventListener('deviceorientation', handleOrientation);
+let compassFrame = null;
 function handleOrientation(e){
-  if(e.webkitCompassHeading != null) deviceHeading = e.webkitCompassHeading;
-  else if(e.alpha != null) deviceHeading = 360 - e.alpha;
+  if(e.webkitCompassHeading != null){ deviceHeading = e.webkitCompassHeading; hasAbsoluteHeading = true; }
+  else if((e.type === 'deviceorientationabsolute' || e.absolute === true) && e.alpha != null){ deviceHeading = (360 - e.alpha) % 360; hasAbsoluteHeading = true; }
+  else return;
+  if(!compassFrame) compassFrame = requestAnimationFrame(()=>{ compassFrame = null; updateCompass(); });
 }
+
+// ================= TEAM SESSION (live data) =================
+// Fires on every change to any team. Keeps currentTeam fresh (rent received, organiser edits,
+// auction wins…) and follows an organiser rename by matching this phone's token.
+function onTeamsSnapshot(snap){
+  const val = snap.val() || {};
+  const byName = {};
+  Object.keys(val).forEach(k=>{ const t = val[k]; if(t && t.name) byName[t.name] = t; });
+  teamsCache = byName;
+  let mine = val[myTeamKey];
+  if((!mine || !mine.name) && currentTeam && currentTeam.token){
+    const match = Object.values(byName).find(t=>t.token === currentTeam.token);
+    if(match){ mine = match; myTeamKey = safeKey(match.name); }
+  }
+  if(mine && mine.name){
+    const renamed = currentTeam && currentTeam.name !== mine.name;
+    currentTeam = mine;
+    if(renamed) updateTeamIdentity();
+  }
+  scheduleTeamRender();
+  renderOwnPropertyActivity();
+}
+function updateTeamIdentity(){
+  if(!currentTeam) return;
+  const label = (currentTeam.icon ? currentTeam.icon + ' ' : '') + currentTeam.name;
+  document.getElementById('role-subtitle').textContent = 'Playing as ' + label;
+  const w = document.getElementById('wallet-team-name');
+  if(w) w.textContent = label;
+}
+// Converts a legacy array-shaped `owned` to the map shape once, at sign-in.
+async function migrateOwnedShape(teamName){
+  try{
+    await db.ref(teamPath(teamName, 'owned')).transaction(cur=>{
+      if(cur == null) return null;
+      if(Array.isArray(cur) || Object.values(cur).some(v=>typeof v === 'string')) return toOwnedMap(cur);
+      return; // already a map — leave it
+    });
+  }catch(e){}
+}
+let teamRenderTimer = null;
+function scheduleTeamRender(){
+  if(teamRenderTimer) return;
+  teamRenderTimer = setTimeout(()=>{ teamRenderTimer = null; renderTeamView(); }, 250);
+}
+function renderTeamView(){
+  if(currentRole !== 'team' || !currentTeam) return;
+  refreshWallet();
+  renderStops();
+  renderSpecials();
+  updateCompass();
+  renderPlayerMap();
+}
+async function requestWakeLock(){
+  if(currentRole !== 'team' || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try{ wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible' && currentRole === 'team'){ requestWakeLock(); scheduleTeamRender(); checkMeetupFine(); }
+});
 
 function refreshWallet(){
   if(!currentTeam) return;
-  document.getElementById('cash-display').textContent = '£' + currentTeam.cash;
-  document.getElementById('portfolio-display').textContent = (currentTeam.owned||[]).length;
-  const visitedCount = Object.keys(currentTeam.visited || {}).length;
-  const pct = Math.round((visitedCount / PROPERTIES.length) * 100);
+  const cashEl = document.getElementById('cash-display');
+  cashEl.textContent = fmtMoney(currentTeam.cash);
+  cashEl.classList.toggle('stat-alert', (currentTeam.cash||0) < 0);
+  const negNote = document.getElementById('negative-note');
+  if(negNote) negNote.style.display = (currentTeam.cash||0) < 0 ? 'block' : 'none';
+  document.getElementById('portfolio-display').textContent = ownedIds(currentTeam).length;
+  const visitedCount = PROPERTIES.filter(p=>currentTeam.visited && currentTeam.visited[p.id]).length;
+  const pct = PROPERTIES.length ? Math.round((visitedCount / PROPERTIES.length) * 100) : 0;
   document.getElementById('visited-progress-label').textContent = visitedCount + ' / ' + PROPERTIES.length + ' visited';
   const fill = document.getElementById('visited-progress-fill');
   fill.style.width = pct + '%';
@@ -487,123 +794,155 @@ function refreshWallet(){
   if(flags.fineImmunity) bits.push(flags.fineImmunity + '× Fine Immunity');
   if(flags.rentBoost) bits.push(flags.rentBoost + '× Rent Boost');
   document.getElementById('cards-display').textContent = bits.length ? 'Active cards: ' + bits.join(', ') : 'No bonus cards held';
+  renderEventClock();
 }
+// Countdown to config.eventEnd, and the "board locked" banner once the game is over.
+let lastLockState = null;
+function renderEventClock(){
+  const clock = document.getElementById('event-clock');
+  const banner = document.getElementById('lock-banner');
+  const locked = isGameLocked();
+  if(banner){
+    banner.style.display = locked ? 'block' : 'none';
+    banner.textContent = lockedMessage();
+    banner.classList.toggle('waiting', /not-started|paused/.test(gameLockReason() || ''));
+  }
+  if(clock){
+    const end = eventEndTs();
+    if(locked || end == null || isNaN(end)){ clock.style.display = 'none'; }
+    else{
+      const mins = Math.max(0, Math.ceil((end - Date.now())/60000));
+      clock.style.display = 'block';
+      clock.textContent = '⏱ Game ends in ' + (mins >= 60 ? Math.floor(mins/60) + 'h ' + String(mins%60).padStart(2,'0') + 'm' : mins + ' min');
+      clock.className = 'event-clock' + (mins <= 15 ? ' soon' : '');
+    }
+  }
+  if(lastLockState !== null && lastLockState !== locked) scheduleTeamRender();
+  lastLockState = locked;
+}
+setInterval(()=>{ if(currentRole==='team') renderEventClock(); }, 10000);
 
 // ================= GPS =================
 function startGPS(){
   const statusEl = document.getElementById('gps-status');
   if(!navigator.geolocation){ statusEl.textContent = 'Geolocation not supported.'; statusEl.className='status-line err'; return; }
-  navigator.geolocation.watchPosition(
+  if(gpsWatchId != null) navigator.geolocation.clearWatch(gpsWatchId);
+  gpsWatchId = navigator.geolocation.watchPosition(
     pos=>{
       currentPosition = pos.coords;
-      statusEl.textContent = `Location locked · accuracy ±${Math.round(pos.coords.accuracy)}m`;
-      statusEl.className = 'status-line good';
+      const acc = Math.round(pos.coords.accuracy);
+      const weak = pos.coords.accuracy > config.geofenceRadius;
+      statusEl.textContent = weak
+        ? `GPS is weak (±${acc}m) — check-ins need ±${config.geofenceRadius}m or better. Step away from tall buildings.`
+        : `Location locked · accuracy ±${acc}m`;
+      statusEl.className = 'status-line ' + (weak ? 'warn' : 'good');
       maybeWriteLocation();
-      renderStops();
-      renderSpecials();
-      updateCompass();
-      renderPlayerMap();
+      scheduleTeamRender();
+      maybeCheckMeetup();
     },
     err=>{ statusEl.textContent = 'Location unavailable: ' + err.message; statusEl.className='status-line err'; },
     {enableHighAccuracy:true, maximumAge:5000, timeout:15000}
   );
 }
+// Position lives at /positions/{team} — never on the team record — so a ping can't overwrite
+// cash or properties.
 async function maybeWriteLocation(){
-  if(!currentTeam || !currentPosition) return;
+  if(!currentTeam || !currentPosition || !myTeamKey) return;
   const now = Date.now();
   if(now - lastLocationWrite < 15000) return;
   lastLocationWrite = now;
-  currentTeam.lastLocation = {lat:currentPosition.latitude, lng:currentPosition.longitude, ts:now};
-  await saveTeam(currentTeam);
+  try{
+    await db.ref(gamePath('/positions/'+myTeamKey)).set({lat:currentPosition.latitude, lng:currentPosition.longitude, acc:Math.round(currentPosition.accuracy), ts:now});
+  }catch(e){}
 }
 
 // ================= COMPASS =================
 function updateCompass(){
   if(!currentTeam || !currentPosition) return;
-  const remaining = PROPERTIES.filter(p=>!(currentTeam.visited && currentTeam.visited[p.id]))
-    .concat(SPECIALS.filter(s=>!(currentTeam.specialDraws && currentTeam.specialDraws[s.id])));
-  if(remaining.length === 0){
-    document.getElementById('compass-target').textContent = 'All stops visited!';
-    document.getElementById('compass-dist').textContent = '';
+  const targetEl = document.getElementById('compass-target');
+  const distEl = document.getElementById('compass-dist');
+  const arrow = document.getElementById('compass-arrow');
+  const rose = document.getElementById('compass-rose');
+  const useHeading = hasAbsoluteHeading && deviceHeading != null;
+  // The N marker turns with the phone when the arrow is phone-relative, so it always points north.
+  if(rose) rose.style.transform = `rotate(${useHeading ? -deviceHeading : 0}deg)`;
+  const next = getNearestRemaining();
+  if(!next){
+    const anyLeft = PROPERTIES.some(p=>!(currentTeam.visited && currentTeam.visited[p.id]))
+      || activeSpecials().some(s=>!(currentTeam.specialDraws && currentTeam.specialDraws[s.id]));
+    targetEl.textContent = anyLeft ? 'You\'re at your next stop' : 'All stops visited!';
+    distEl.textContent = '';
+    arrow.style.opacity = '0';
     return;
   }
-  let nearest = null, nd = Infinity;
-  remaining.forEach(p=>{
-    const c = getLatLng(p);
-    const d = haversine(currentPosition.latitude, currentPosition.longitude, c.lat, c.lng);
-    if(d < nd){ nd = d; nearest = p; }
-  });
-  const nc = getLatLng(nearest);
+  arrow.style.opacity = '1';
+  const nc = getLatLng(next.stop);
   const b = bearing(currentPosition.latitude, currentPosition.longitude, nc.lat, nc.lng);
-  const arrowRotation = deviceHeading != null ? (b - deviceHeading + 360) % 360 : b;
-  document.getElementById('compass-arrow').style.transform = `rotate(${arrowRotation}deg)`;
-  document.getElementById('compass-target').textContent = nearest.name;
-  document.getElementById('compass-dist').textContent = fmtDist(nd) + (deviceHeading==null ? ' · true bearing' : ' · relative to phone');
+  const arrowRotation = useHeading ? (b - deviceHeading + 360) % 360 : b;
+  arrow.style.transform = `rotate(${arrowRotation}deg)`;
+  targetEl.textContent = 'Next: ' + next.stop.name;
+  distEl.textContent = fmtDist(next.dist) + (useHeading ? ' · arrow follows your phone' : ' · arrow is from north (N at top)');
 }
 
 // ================= BOARD RENDER (Play tab) =================
-function buildStopRow(p, teamsData, owners){
+// What a team can do at a property right now. Shared by the main list and the "You're here" card.
+function propertyAction(p, teamsData, owners){
   const visited = currentTeam.visited && currentTeam.visited[p.id];
   const owner = owners[p.id];
-  const pc = getLatLng(p);
-  const dist = currentPosition ? haversine(currentPosition.latitude, currentPosition.longitude, pc.lat, pc.lng) : null;
-  const inRange = dist !== null && dist <= config.geofenceRadius;
-  const rent = currentRent(p, owner, teamsData);
-
-  if(inRange && !visited && !notifiedIds.has(p.id)){
-    notifiedIds.add(p.id);
-    notify('You reached ' + p.name, owner ? ('Owned by ' + owner + ' — pay rent £' + rent) : ('Unowned — buy for £' + p.price));
-  }
-
-  const row = document.createElement('div');
-  let rowClass = 'stop';
-  if(inRange) rowClass += ' inrange';
-  if(owner === currentTeam.name) rowClass += ' mine';
-  else if(owner) rowClass += ' theirs';
-  row.className = rowClass;
-
-  let ownerTag = '';
-  if(owner) ownerTag = `<span class="owner-tag ${owner===currentTeam.name?'mine':'theirs'}">${owner===currentTeam.name?'YOURS':owner}</span>`;
-
-  let actionHtml = '';
-  if(config.finalized){
-    actionHtml = `<button class="act-disabled" disabled>ENDED</button>`;
-  } else if(visited && owner !== currentTeam.name){
-    actionHtml = `<button class="act-visited" disabled>VISITED</button>`;
-  } else if(!inRange){
-    actionHtml = `<button class="act-disabled" disabled>TOO FAR</button>`;
-  } else if(!owner){
-    actionHtml = `<button class="act-buy" data-action="buy" data-id="${p.id}">BUY £${p.price}</button><button class="act-visited" data-action="pass" data-id="${p.id}">JUST VISIT</button>`;
-  } else if(owner === currentTeam.name){
-    actionHtml = `<button class="act-visited" disabled>OWNED BY YOU</button>`;
+  const prox = proximity(p);
+  const due = rentDue(p, owner, teamsData);
+  const dis = busyActions.has('prop:'+p.id) ? ' disabled' : '';
+  const id = esc(p.id);
+  let html, actionable = false;
+  if(isGameLocked()) html = `<button class="act-disabled" disabled>${lockedButtonLabel()}</button>`;
+  else if(owner === currentTeam.name) html = `<button class="act-visited" disabled>OWNED BY YOU</button>`;
+  else if(visited) html = `<button class="act-visited" disabled>VISITED</button>`;
+  else if(prox.weak) html = `<button class="act-disabled" disabled>GPS WEAK</button>`;
+  else if(!prox.inRange) html = `<button class="act-disabled" disabled>TOO FAR</button>`;
+  else if(!owner){
+    actionable = true;
+    html = `<button class="act-buy" data-action="buy" data-id="${id}"${dis}>BUY £${p.price}</button><button class="act-visited" data-action="pass" data-id="${id}"${dis}>JUST VISIT</button>`;
   } else {
-    actionHtml = `<button class="act-rent" data-action="rent" data-id="${p.id}">PAY RENT £${rent}</button>`;
+    actionable = true;
+    html = `<button class="act-rent" data-action="rent" data-id="${id}"${dis}>PAY RENT £${due.rent}</button>`;
   }
-
+  return {html, actionable, prox, owner, due};
+}
+function buildStopRow(p, teamsData, owners, compact){
+  const a = propertyAction(p, teamsData, owners);
+  const mine = a.owner === currentTeam.name;
+  const row = document.createElement('div');
+  row.className = 'stop' + (a.prox.inRange ? ' inrange' : '') + (mine ? ' mine' : a.owner ? ' theirs' : '');
+  const ownerTag = a.owner ? `<span class="owner-tag ${mine?'mine':'theirs'}">${mine?'YOURS':esc(a.owner)}</span>` : '';
+  const rentLabel = 'rent £' + a.due.rent + (a.due.boosted ? ' (Rent Boost!)' : '');
+  const meta = `${a.prox.dist!==null?fmtDist(a.prox.dist)+' away':'locating…'} · £${p.price} to buy · ${rentLabel} · ${esc(p.group)}`;
+  const isOpen = openInfo.has(p.id);
+  const info = compact ? '' : `
+      <button class="info-toggle" data-info="${esc(p.id)}">${isOpen?'Hide info':'ℹ️ info'}</button>
+      <div class="stop-detail${isOpen?' open':''}">
+        <div>${esc(p.fact||'')}</div>
+        <img data-photo="${esc(p.id)}" alt="" ${photoCache[p.id] ? `src="${esc(photoCache[p.id])}"` : 'style="display:none;"'}>
+      </div>`;
   row.innerHTML = `
-    <div class="stop-swatch" style="background:${p.color}"></div>
+    <div class="stop-swatch" style="background:${esc(p.color)}"></div>
     <div class="stop-body">
-      <div class="stop-name">${p.name} ${ownerTag}</div>
-      <div class="stop-meta">${dist!==null?fmtDist(dist)+' away':'locating…'} · £${p.price} to buy · rent £${rent} · ${p.group}</div>
-      <button class="info-toggle" data-info="${p.id}">ℹ️ info</button>
-      <div class="stop-detail" id="detail-${p.id}">
-        <div>${p.fact||''}</div>
-        <img id="photo-${p.id}" style="display:none;">
-      </div>
+      <div class="stop-name">${esc(p.name)} ${ownerTag}</div>
+      <div class="stop-meta">${meta}</div>${info}
     </div>
-    <div class="stop-actions">${actionHtml}</div>
+    <div class="stop-actions">${a.html}</div>
   `;
   return row;
 }
-async function toggleInfo(propId){
-  const detail = document.getElementById('detail-'+propId);
-  if(!detail) return;
-  const opening = !detail.classList.contains('open');
-  detail.classList.toggle('open');
-  if(!opening) return;
-  const img = document.getElementById('photo-'+propId);
-  if(!img) return;
-  if(photoCache[propId]){ img.src = photoCache[propId]; img.style.display = 'block'; return; }
+// Open/closed state lives in openInfo so a re-render (GPS tick, someone else's purchase) keeps it.
+async function toggleInfo(propId, rowEl){
+  if(!rowEl) return;
+  const detail = rowEl.querySelector('.stop-detail');
+  const btn = rowEl.querySelector('.info-toggle');
+  const opening = !openInfo.has(propId);
+  if(opening) openInfo.add(propId); else openInfo.delete(propId);
+  if(detail) detail.classList.toggle('open', opening);
+  if(btn) btn.textContent = opening ? 'Hide info' : 'ℹ️ info';
+  if(!opening || photoCache[propId]) return;
   const prop = PROPERTIES.find(p=>p.id===propId);
   if(!prop || !prop.wikiTitle) return;
   try{
@@ -612,199 +951,465 @@ async function toggleInfo(propId){
       const data = await res.json();
       if(data.thumbnail && data.thumbnail.source){
         photoCache[propId] = data.thumbnail.source;
-        img.src = data.thumbnail.source;
-        img.style.display = 'block';
+        document.querySelectorAll(`img[data-photo="${CSS.escape(propId)}"]`).forEach(img=>{ img.src = data.thumbnail.source; img.style.display = 'block'; });
       }
     }
   }catch(e){}
 }
-async function renderStops(){
+function wireStopButtons(container){
+  container.querySelectorAll('[data-action]').forEach(btn=>{
+    btn.addEventListener('click', ()=>handleAction(btn.dataset.action, btn.dataset.id));
+  });
+  container.querySelectorAll('[data-info]').forEach(btn=>{
+    btn.addEventListener('click', ()=>toggleInfo(btn.dataset.info, btn.closest('.stop')));
+  });
+  container.querySelectorAll('[data-special]').forEach(btn=>{
+    btn.addEventListener('click', ()=>drawCard(btn.dataset.special));
+  });
+  container.querySelectorAll('[data-buy-card]').forEach(btn=>{
+    btn.addEventListener('click', ()=>buyCard());
+  });
+}
+// Pinned at the top of Play: only the stops this team can act on right now.
+function renderHereCard(teamsData, owners){
+  const card = document.getElementById('here-card');
+  const body = document.getElementById('here-body');
+  if(!card || !body) return;
+  const rows = [];
+  if(!isGameLocked()){
+    PROPERTIES.forEach(p=>{ if(propertyAction(p, teamsData, owners).actionable) rows.push(buildStopRow(p, teamsData, owners, true)); });
+    activeSpecials().forEach(s=>{ if(specialState(s).actionable) rows.push(buildSpecialRow(s)); });
+  }
+  if(!rows.length){ card.style.display = 'none'; body.innerHTML = ''; return; }
+  card.style.display = 'block';
+  body.innerHTML = '';
+  rows.forEach(r=>body.appendChild(r));
+  wireStopButtons(body);
+}
+// Synchronous: works off the live teamsCache, so a GPS tick doesn't re-read every team.
+function renderStops(){
   if(!currentTeam) return;
-  const teamsData = await listTeams();
-  teamsData[currentTeam.name] = currentTeam;
+  const teamsData = teamsCache;
   const owners = ownershipMap(teamsData);
+
+  PROPERTIES.forEach(p=>{
+    if(notifiedIds.has(p.id) || (currentTeam.visited && currentTeam.visited[p.id])) return;
+    if(isGameLocked() || !proximity(p).inRange) return;
+    notifiedIds.add(p.id);
+    const owner = owners[p.id];
+    if(owner === currentTeam.name) return;
+    const due = rentDue(p, owner, teamsData);
+    notify('You reached ' + p.name, owner
+      ? ('Owned by ' + owner + ' — pay rent £' + due.rent + (due.boosted ? ' (doubled by their Rent Boost)' : ''))
+      : ('Unowned — buy for £' + p.price));
+  });
+  renderHereCard(teamsData, owners);
+
   const container = document.getElementById('stops-container');
   container.innerHTML = '';
-
+  if(PROPERTIES.length === 0){ container.innerHTML = '<div class="empty">No properties on this board yet.</div>'; return; }
   if(sortMode === 'distance'){
     const sorted = [...PROPERTIES].sort((a,b)=>{
       if(!currentPosition) return 0;
-      const ca = getLatLng(a), cb = getLatLng(b);
-      const da = haversine(currentPosition.latitude, currentPosition.longitude, ca.lat, ca.lng);
-      const db_ = haversine(currentPosition.latitude, currentPosition.longitude, cb.lat, cb.lng);
-      return da - db_;
+      return proximity(a).dist - proximity(b).dist;
     });
     const grid = document.createElement('div');
     grid.className = 'group-grid';
     sorted.forEach(p=>grid.appendChild(buildStopRow(p, teamsData, owners)));
     container.appendChild(grid);
   } else {
+    // "Near you": stops still worth visiting within NEAR_RADIUS, nearest first. The full board
+    // follows, folded by colour group with set progress, so the list stays short on a phone.
+    const near = currentPosition ? PROPERTIES.filter(p=>{
+      const d = proximity(p).dist;
+      return d <= NEAR_RADIUS && !(currentTeam.visited && currentTeam.visited[p.id]) && owners[p.id] !== currentTeam.name;
+    }).sort((a,b)=>proximity(a).dist - proximity(b).dist) : [];
+    if(near.length){
+      const nh = document.createElement('div');
+      nh.className = 'group-header';
+      nh.innerHTML = `<span class="swatch" style="background:var(--ba-blue-corp)"></span><span class="group-title">Near you · within ${NEAR_RADIUS} m</span>`;
+      container.appendChild(nh);
+      const nearGrid = document.createElement('div');
+      nearGrid.className = 'group-grid';
+      near.forEach(p=>nearGrid.appendChild(buildStopRow(p, teamsData, owners)));
+      container.appendChild(nearGrid);
+    }
     GROUP_ORDER.forEach(group=>{
       const items = PROPERTIES.filter(p=>p.group===group);
-      const gh = document.createElement('div');
-      gh.className = 'group-header';
-      gh.innerHTML = `<span class="swatch" style="background:${items[0].color}"></span><span class="group-title">${group}</span>`;
-      container.appendChild(gh);
+      const det = document.createElement('details');
+      det.className = 'group-block';
+      det.open = openGroups.has(group);
+      const sp = setProgress(group, owners);
+      det.innerHTML = `<summary class="group-summary">
+          <span class="swatch" style="background:${esc(items[0].color)}"></span>
+          <span class="group-title">${esc(group)}</span>
+          <span class="set-dots">${sp.dots}</span>
+          <span class="set-text">${esc(sp.text)}</span>
+        </summary>`;
+      det.addEventListener('toggle', ()=>{ if(det.open) openGroups.add(group); else openGroups.delete(group); });
       const groupGrid = document.createElement('div');
       groupGrid.className = 'group-grid';
       items.forEach(p=>groupGrid.appendChild(buildStopRow(p, teamsData, owners)));
-      container.appendChild(groupGrid);
+      det.appendChild(groupGrid);
+      container.appendChild(det);
     });
   }
-
-  container.querySelectorAll('[data-action]').forEach(btn=>{
-    btn.addEventListener('click', ()=>handleAction(btn.dataset.action, btn.dataset.id));
-  });
-  container.querySelectorAll('[data-info]').forEach(btn=>{
-    btn.addEventListener('click', ()=>toggleInfo(btn.dataset.info));
-  });
+  wireStopButtons(container);
 }
-document.querySelectorAll('.sort-row button').forEach(btn=>{
+const NEAR_RADIUS = 500;
+const openGroups = new Set();
+// One dot per property in a colour group (yours / another team's / unowned) plus a short summary:
+// how many you own, whether a rival is one away from the set, and how many you've visited.
+function setProgress(group, owners){
+  const items = PROPERTIES.filter(p=>p.group===group);
+  const n = items.length;
+  const isStations = items.every(p=>p.type === 'station');
+  const me = currentTeam ? currentTeam.name : null;
+  const counts = {};
+  items.forEach(p=>{ const o = owners[p.id]; if(o) counts[o] = (counts[o]||0) + 1; });
+  const dots = items.map(p=>{
+    const o = owners[p.id];
+    const cls = !o ? 'free' : o === me ? 'mine' : 'theirs';
+    return `<i class="set-dot ${cls}" title="${esc(p.name)}${o ? ' — ' + esc(o) : ''}"></i>`;
+  }).join('');
+  const parts = [];
+  const mine = me ? (counts[me] || 0) : 0;
+  if(mine) parts.push(!isStations && mine === n ? 'Set complete — double rent' : `You own ${mine} of ${n}`);
+  Object.keys(counts).filter(o=>o !== me).forEach(o=>{
+    if(isStations) return;
+    if(counts[o] === n) parts.push(`${o} has the set`);
+    else if(n > 1 && counts[o] === n - 1) parts.push(`${o} needs 1 more`);
+  });
+  if(currentTeam){
+    const v = items.filter(p=>currentTeam.visited && currentTeam.visited[p.id]).length;
+    parts.push(`${v}/${n} visited`);
+  }
+  return {dots, text: parts.join(' · ')};
+}
+document.querySelectorAll('.sort-row button[data-sort]').forEach(btn=>{
   btn.addEventListener('click', ()=>{
     sortMode = btn.dataset.sort;
-    document.querySelectorAll('.sort-row button').forEach(b=>b.classList.toggle('active', b===btn));
+    document.querySelectorAll('.sort-row button[data-sort]').forEach(b=>b.classList.toggle('active', b===btn));
     renderStops();
   });
 });
 
+// Every action is guarded three ways: the button is disabled on tap, the action key is held in
+// busyActions until it finishes, and the scoring write is gated by a Firebase transaction that
+// claims the visit / ownership / draw first — so a double tap can only ever charge once.
 async function handleAction(action, propId){
   const prop = PROPERTIES.find(p=>p.id===propId);
   if(!prop || !currentTeam) return;
-  const teamsData = await listTeams();
-  const owners = ownershipMap(teamsData);
-  currentTeam.visited = currentTeam.visited || {};
-
-  if(action === 'pass'){
-    currentTeam.visited[propId] = Date.now();
-    await saveTeam(currentTeam);
-    await logActivity('visit', currentTeam.name, {propertyId: prop.id, propertyName: prop.name});
-    toast('Marked ' + prop.name + ' as visited.');
-  } else if(action === 'buy'){
-    if(owners[propId]){ toast('Someone just bought that — refreshing.'); }
-    else if(currentTeam.cash < prop.price){ toast('Not enough cash to buy ' + prop.name + '.'); }
-    else{
-      currentTeam.cash -= prop.price;
-      currentTeam.owned = currentTeam.owned || [];
-      currentTeam.owned.push(propId);
-      currentTeam.visited[propId] = Date.now();
-      currentTeam.lastPurchase = {name: prop.name, ts: Date.now()};
-      await saveTeam(currentTeam);
-      await logActivity('buy', currentTeam.name, {propertyId: prop.id, propertyName: prop.name, price: prop.price});
-      toast('Bought ' + prop.name + ' for £' + prop.price + '!');
-    }
-  } else if(action === 'rent'){
-    const ownerName = owners[propId];
-    const ownerTeam = teamsData[ownerName];
-    if(!ownerTeam){ toast('Owner data missing — try refresh.'); }
-    else{
-      let rent = currentRent(prop, ownerName, teamsData);
-      let boosted = false;
-      if(ownerTeam.cardFlags && ownerTeam.cardFlags.rentBoost > 0){
-        rent *= 2; boosted = true;
-        ownerTeam.cardFlags.rentBoost -= 1;
-      }
-      currentTeam.cash -= rent;
-      currentTeam.visited[propId] = Date.now();
-      ownerTeam.cash += rent;
-      await saveTeam(ownerTeam);
-      await saveTeam(currentTeam);
-      await logActivity('rent', currentTeam.name, {propertyId: prop.id, propertyName: prop.name, owner: ownerName, amount: rent, boosted});
-      toast('Paid £' + rent + ' rent to ' + ownerName + (boosted ? ' (doubled by their Rent Boost card!)' : '') + '.');
-    }
+  const key = 'prop:'+propId;
+  if(busyActions.has(key)) return;
+  if(isGameLocked()){ toast(lockedMessage()); return; }
+  if(!proximity(prop).inRange){ toast('You need to be at ' + prop.name + ' to do that.'); return; }
+  busyActions.add(key);
+  document.querySelectorAll(`[data-id="${CSS.escape(propId)}"]`).forEach(b=>{ b.disabled = true; });
+  try{
+    if(action === 'pass'){
+      if(confirm(`Just visit ${prop.name} without buying it?\n\nThis can't be undone — you won't be able to buy it later.`)) await doPass(prop);
+    } else if(action === 'buy') await doBuy(prop);
+    else if(action === 'rent') await doRent(prop);
+  }catch(e){
+    toast('That didn\'t go through — check your signal and try again.');
+  }finally{
+    busyActions.delete(key);
+    scheduleTeamRender();
   }
-  refreshWallet();
-  renderStops();
-  renderOwnPropertyActivity();
+}
+// Claims this team's visit to a stop. Only the first claim commits.
+async function claimVisit(propId){
+  const tx = await db.ref(teamPath(currentTeam.name, 'visited/'+propId)).transaction(cur=>cur ? undefined : Date.now());
+  return tx.committed;
+}
+async function doPass(prop){
+  if(!await claimVisit(prop.id)){ toast('You\'ve already visited ' + prop.name + '.'); return; }
+  await logActivity('visit', currentTeam.name, {propertyId: prop.id, propertyName: prop.name});
+  toast('Marked ' + prop.name + ' as visited.');
+}
+async function doBuy(prop){
+  const name = currentTeam.name;
+  const owner = ownershipMap(teamsCache)[prop.id];
+  if(owner){ toast(owner === name ? 'You already own ' + prop.name + '.' : prop.name + ' is already owned by ' + owner + '.'); return; }
+  if(currentTeam.visited && currentTeam.visited[prop.id]){ toast('You\'ve already visited ' + prop.name + '.'); return; }
+  if((currentTeam.cash||0) < prop.price){ toast('Not enough cash to buy ' + prop.name + '.'); return; }
+  // The ownership claim is the lock: if two teams tap Buy at once, only one transaction commits.
+  const claim = await db.ref(gamePath('/ownership/'+prop.id)).transaction(cur=>cur ? undefined : name);
+  if(!claim.committed){ toast('Too late — someone else just bought ' + prop.name + '.'); return; }
+  const now = Date.now();
+  await addOwned(name, prop.id);
+  await db.ref(teamPath(name)).update({cash: inc(-prop.price), ['visited/'+prop.id]: now, lastPurchase: {name: prop.name, ts: now}});
+  await logActivity('buy', name, {propertyId: prop.id, propertyName: prop.name, price: prop.price});
+  toast('Bought ' + prop.name + ' for £' + prop.price + '!');
+}
+async function doRent(prop){
+  const me = currentTeam.name;
+  const ownerName = ownershipMap(teamsCache)[prop.id];
+  if(!ownerName || ownerName === me){ toast('There\'s no rent to pay here.'); return; }
+  if(!await claimVisit(prop.id)){ toast('You\'ve already paid at ' + prop.name + '.'); return; }
+  let rent = currentRent(prop, ownerName, teamsCache);
+  // Consume one of the owner's Rent Boost cards, if they have any left.
+  const boostTx = await db.ref(teamPath(ownerName, 'cardFlags/rentBoost')).transaction(cur=>(cur||0) > 0 ? cur - 1 : undefined);
+  const boosted = boostTx.committed;
+  if(boosted) rent *= 2;
+  await db.ref(gamePath('')).update({
+    ['teams/'+safeKey(me)+'/cash']: inc(-rent),
+    ['teams/'+safeKey(ownerName)+'/cash']: inc(rent)
+  });
+  await logActivity('rent', me, {propertyId: prop.id, propertyName: prop.name, owner: ownerName, amount: rent, boosted});
+  toast('Paid £' + rent + ' rent to ' + ownerName + (boosted ? ' (doubled by their Rent Boost card!)' : '') + '.');
 }
 
 // ================= SPECIALS =================
+function specialState(s){
+  const drawn = currentTeam.specialDraws && currentTeam.specialDraws[s.id];
+  const prox = proximity(s);
+  const dis = busyActions.has('special:'+s.id) ? ' disabled' : '';
+  let html, actionable = false;
+  if(isGameLocked()) html = `<button class="act-disabled" disabled>${lockedButtonLabel()}</button>`;
+  else if(drawn) html = `<button class="act-visited" disabled>DRAWN</button>`;
+  else if(prox.weak) html = `<button class="act-disabled" disabled>GPS WEAK</button>`;
+  else if(!prox.inRange) html = `<button class="act-disabled" disabled>TOO FAR</button>`;
+  else { actionable = true; html = `<button class="act-buy" data-special="${esc(s.id)}"${dis}>DRAW CARD</button>`; }
+  return {html, actionable, prox, drawn};
+}
+function buildSpecialRow(s){
+  const st = specialState(s);
+  const row = document.createElement('div');
+  row.className = 'stop' + (st.prox.inRange && !st.drawn ? ' inrange' : '');
+  row.innerHTML = `
+    <div class="stop-swatch" style="background:var(--red)"></div>
+    <div class="stop-body">
+      <div class="stop-name">${esc(s.name)}</div>
+      <div class="stop-meta">${s.note ? esc(s.note) + ' · ' : ''}${st.prox.dist!==null?fmtDist(st.prox.dist)+' away':'locating…'}</div>
+    </div>
+    <div class="stop-actions">${st.html}</div>
+  `;
+  return row;
+}
+// How teams get Chance cards is a per-game setting (Admin → Event settings):
+//   'location' — one free draw at each Chance / Community Chest point (the original game)
+//   'buy'      — bought from the app, anywhere, for config.cardPrice
+//   'both'     — either
+function cardMode(){ return config.cardMode || 'location'; }
+function drawPointsActive(){ return cardMode() !== 'buy'; }
+function cardBuyingActive(){ return cardMode() !== 'location'; }
+function cardPrice(){ return config.cardPrice != null ? config.cardPrice : DEFAULT_CONFIG.cardPrice; }
+function activeSpecials(){ return drawPointsActive() ? SPECIALS : []; }
+
+function buildBuyCardRow(){
+  const price = cardPrice();
+  const busy = busyActions.has('buycard');
+  const bought = currentTeam.cardsBought || 0;
+  let html;
+  if(isGameLocked()) html = `<button class="act-disabled" disabled>${lockedButtonLabel()}</button>`;
+  else if((currentTeam.cash||0) < price) html = `<button class="act-disabled" disabled>NEED ${fmtMoney(price)}</button>`;
+  else html = `<button class="act-buy" data-buy-card="1"${busy ? ' disabled' : ''}>BUY CARD ${fmtMoney(price)}</button>`;
+  const row = document.createElement('div');
+  row.className = 'stop buy-card-row';
+  row.innerHTML = `
+    <div class="mini-card" aria-hidden="true"><span>?</span></div>
+    <div class="stop-body">
+      <div class="stop-name">Buy a Chance card</div>
+      <div class="stop-meta">A random card from the deck, wherever you are${bought ? ` · ${bought} bought so far` : ''}</div>
+    </div>
+    <div class="stop-actions">${html}</div>`;
+  return row;
+}
 function renderSpecials(){
   if(!currentTeam) return;
   const container = document.getElementById('special-stops');
-  container.innerHTML = '<div class="group-header"><span class="swatch" style="background:var(--red)"></span><span class="group-title">Chance &amp; Community Chest</span></div>';
+  const buying = cardBuyingActive();
+  const points = activeSpecials();
+  if(!buying && points.length === 0){ container.innerHTML = ''; return; }
+  container.innerHTML = `<div class="group-header"><span class="swatch" style="background:var(--red)"></span><span class="group-title">${points.length ? 'Chance &amp; Community Chest' : 'Chance cards'}</span></div>`;
   const specialGrid = document.createElement('div');
   specialGrid.className = 'group-grid';
-  currentTeam.specialDraws = currentTeam.specialDraws || {};
-  SPECIALS.forEach(s=>{
-    const drawn = currentTeam.specialDraws[s.id];
-    const sc = getLatLng(s);
-    const dist = currentPosition ? haversine(currentPosition.latitude, currentPosition.longitude, sc.lat, sc.lng) : null;
-    const inRange = dist !== null && dist <= config.geofenceRadius;
-    const row = document.createElement('div');
-    row.className = 'stop' + (inRange && !drawn ? ' inrange' : '');
-    row.innerHTML = `
-      <div class="stop-swatch" style="background:var(--red)"></div>
-      <div class="stop-body">
-        <div class="stop-name">${s.name}</div>
-        <div class="stop-meta">${s.note} · ${dist!==null?fmtDist(dist)+' away':'locating…'}</div>
-      </div>
-      <div class="stop-actions">
-        ${config.finalized ? `<button class="act-disabled" disabled>ENDED</button>` :
-          drawn ? `<button class="act-visited" disabled>DRAWN</button>` :
-          inRange ? `<button class="act-buy" data-special="${s.id}">DRAW CARD</button>` :
-          `<button class="act-disabled" disabled>TOO FAR</button>`}
-      </div>
-    `;
-    specialGrid.appendChild(row);
-  });
+  if(buying) specialGrid.appendChild(buildBuyCardRow());
+  points.forEach(s=>specialGrid.appendChild(buildSpecialRow(s)));
   container.appendChild(specialGrid);
-  container.querySelectorAll('[data-special]').forEach(btn=>{
-    btn.addEventListener('click', ()=>drawCard(btn.dataset.special));
-  });
+  wireStopButtons(container);
+}
+// Applies a card's effect. A bought card's price comes off in the same write as its effect.
+async function applyCard(card, name, detail, price){
+  price = price || 0;
+  if(card.type === 'auction'){
+    if(price) await db.ref(teamPath(name, 'cash')).set(inc(-price));
+    await logActivity('chance_auction_trigger', name, {...detail, text: card.text});
+    await startAuction();
+  } else if(card.cash != null){
+    await db.ref(teamPath(name, 'cash')).set(inc(card.cash - price));
+    await logActivity('chance_cash', name, {...detail, text: card.text, cash: card.cash});
+  } else if(card.flag){
+    const upd = {['cardFlags/'+card.flag]: inc(1)};
+    if(price) upd.cash = inc(-price);
+    await db.ref(teamPath(name)).update(upd);
+    await logActivity('chance_flag', name, {...detail, text: card.text, flag: card.flag});
+  }
 }
 async function drawCard(specialId){
   if(!currentTeam) return;
-  const card = CARDS[Math.floor(Math.random()*CARDS.length)];
-  currentTeam.specialDraws = currentTeam.specialDraws || {};
-  currentTeam.specialDraws[specialId] = true;
+  const key = 'special:'+specialId;
+  if(busyActions.has(key)) return;
+  if(isGameLocked()){ toast(lockedMessage()); return; }
+  if(!drawPointsActive()){ toast('In this game, cards are bought rather than drawn at locations.'); return; }
   const specialObj = SPECIALS.find(s=>s.id===specialId);
-  const locationLabel = specialObj ? specialObj.name : specialId;
-  if(card.type === 'auction'){
-    await saveTeam(currentTeam);
-    await logActivity('chance_auction_trigger', currentTeam.name, {specialId, locationLabel, text: card.text});
-    await startAuction();
-    toast(card.text, true);
-  } else if(card.cash != null){
-    currentTeam.cash += card.cash;
-    await saveTeam(currentTeam);
-    await logActivity('chance_cash', currentTeam.name, {specialId, locationLabel, text: card.text, cash: card.cash});
-    toast(card.text + (card.cash>=0?' (+£':' (-£')+Math.abs(card.cash)+')', true);
-  } else if(card.flag){
-    currentTeam.cardFlags = currentTeam.cardFlags || {};
-    currentTeam.cardFlags[card.flag] = (currentTeam.cardFlags[card.flag]||0) + 1;
-    await saveTeam(currentTeam);
-    await logActivity('chance_flag', currentTeam.name, {specialId, locationLabel, text: card.text, flag: card.flag});
-    toast(card.text + ' (bonus card added)', true);
+  if(!specialObj || !proximity(specialObj).inRange){ toast('You need to be at the draw point to do that.'); return; }
+  if(CARDS.length === 0){ toast('The card deck is empty — let your organiser know.'); return; }
+  busyActions.add(key);
+  document.querySelectorAll(`[data-special="${CSS.escape(specialId)}"]`).forEach(b=>{ b.disabled = true; });
+  try{
+    const name = currentTeam.name;
+    const claim = await db.ref(teamPath(name, 'specialDraws/'+specialId)).transaction(cur=>cur ? undefined : true);
+    if(!claim.committed){ toast('You\'ve already drawn a card here.'); return; }
+    const card = CARDS[Math.floor(Math.random()*CARDS.length)];
+    await applyCard(card, name, {specialId, locationLabel: specialObj.name});
+    await showCardReveal(card, {deck: specialObj.name});
+  }catch(e){
+    toast('That didn\'t go through — check your signal and try again.');
+  }finally{
+    busyActions.delete(key);
+    scheduleTeamRender();
   }
-  refreshWallet();
-  renderSpecials();
+}
+// Buying a card: one at a time (the button stays locked until the reveal is closed), and only
+// with enough cash for the price.
+async function buyCard(){
+  if(!currentTeam) return;
+  const key = 'buycard';
+  if(busyActions.has(key)) return;
+  if(isGameLocked()){ toast(lockedMessage()); return; }
+  if(!cardBuyingActive()){ toast('In this game, cards are drawn at the Chance and Community Chest locations.'); return; }
+  const price = cardPrice();
+  if((currentTeam.cash||0) < price){ toast('You need ' + fmtMoney(price) + ' to buy a card.'); return; }
+  if(CARDS.length === 0){ toast('The card deck is empty — let your organiser know.'); return; }
+  busyActions.add(key);
+  document.querySelectorAll('[data-buy-card]').forEach(b=>{ b.disabled = true; });
+  try{
+    const name = currentTeam.name;
+    const card = CARDS[Math.floor(Math.random()*CARDS.length)];
+    await db.ref(teamPath(name, 'cardsBought')).set(inc(1));
+    await applyCard(card, name, {bought: true, price}, price);
+    await showCardReveal(card, {deck: 'Chance', price});
+  }catch(e){
+    toast('That didn\'t go through — check your signal and try again.');
+  }finally{
+    busyActions.delete(key);
+    scheduleTeamRender();
+  }
+}
+
+// ================= CARD REVEAL ANIMATION =================
+// The card flies in face down, shakes, flips to show its text and effect, then bursts. Resolves
+// when the player closes it. Respects reduced-motion (shows the face straight away).
+function cardEffect(card){
+  if(card.type === 'auction') return {label: 'Auction!', sub: 'A sealed-bid auction is starting for a random property — check the red banner.', tone: 'auction'};
+  if(card.cash != null) return {label: (card.cash >= 0 ? '+' : '-') + '£' + Math.abs(card.cash), sub: card.cash >= 0 ? 'Added to your cash' : 'Taken from your cash', tone: card.cash >= 0 ? 'good' : 'bad'};
+  if(card.flag === 'fineImmunity') return {label: 'Fast Track', sub: 'Bonus card: cancels your biggest end-of-game fine', tone: 'bonus'};
+  return {label: 'Rent Boost', sub: 'Bonus card: doubles the next rent another team pays you', tone: 'bonus'};
+}
+function showCardReveal(card, opts){
+  opts = opts || {};
+  return new Promise(resolve=>{
+    const eff = cardEffect(card);
+    const ov = document.createElement('div');
+    ov.className = 'card-reveal';
+    ov.setAttribute('role', 'dialog');
+    ov.setAttribute('aria-modal', 'true');
+    ov.setAttribute('aria-label', 'Your card');
+    ov.innerHTML = `
+      <div class="cr-stage">
+        <div class="cr-burst"></div>
+        <div class="cr-card">
+          <div class="cr-face cr-back"><div class="cr-back-inner"><div class="cr-q">?</div><div class="cr-back-label"></div></div></div>
+          <div class="cr-face cr-front tone-${eff.tone}">
+            <div class="cr-deck"></div>
+            <div class="cr-text"></div>
+            <div class="cr-effect"></div>
+            <div class="cr-sub"></div>
+          </div>
+        </div>
+      </div>
+      <div class="cr-caption" aria-live="polite"></div>
+      <button class="btn cr-close" type="button" disabled>Collect</button>`;
+    ov.querySelector('.cr-back-label').textContent = (opts.deck || 'Chance').toUpperCase();
+    ov.querySelector('.cr-deck').textContent = opts.deck || 'Chance';
+    ov.querySelector('.cr-text').textContent = card.text;
+    ov.querySelector('.cr-effect').textContent = eff.label;
+    ov.querySelector('.cr-sub').textContent = eff.sub;
+    const caption = ov.querySelector('.cr-caption');
+    caption.textContent = opts.price ? `Card bought for ${fmtMoney(opts.price)} — opening…` : 'Drawing your card…';
+    document.body.appendChild(ov);
+    let revealed = false, done = false;
+    const close = ()=>{
+      if(!revealed || done) return;
+      done = true;
+      ov.classList.add('leaving');
+      document.removeEventListener('keydown', onKey);
+      setTimeout(()=>{ ov.remove(); resolve(); }, 250);
+    };
+    const onKey = e=>{ if(e.key === 'Escape' || e.key === 'Enter') close(); };
+    const reveal = ()=>{
+      revealed = true;
+      ov.classList.add('revealed');
+      caption.textContent = card.text + ' — ' + eff.label;
+      const btn = ov.querySelector('.cr-close');
+      btn.disabled = false;
+      btn.focus();
+    };
+    ov.querySelector('.cr-close').addEventListener('click', close);
+    ov.addEventListener('click', e=>{ if(e.target === ov) close(); });
+    document.addEventListener('keydown', onKey);
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if(reduce){ ov.classList.add('enter', 'flip'); reveal(); return; }
+    requestAnimationFrame(()=>ov.classList.add('enter'));
+    setTimeout(()=>ov.classList.add('shake'), 650);
+    setTimeout(()=>{ ov.classList.remove('shake'); ov.classList.add('flip'); }, 1450);
+    setTimeout(reveal, 2150);
+  });
 }
 
 // ================= BOARD OVERVIEW =================
+let boardMode = 'ring';
+document.querySelectorAll('[data-board-mode]').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    boardMode = btn.dataset.boardMode;
+    document.querySelectorAll('[data-board-mode]').forEach(b=>b.classList.toggle('active', b===btn));
+    renderBoardOverview();
+  });
+});
 async function renderBoardOverview(){
   const el = document.getElementById('board-overview');
-  el.innerHTML = '<div class="empty">Loading…</div>';
+  const ringWrap = document.getElementById('board-ring-wrap');
   const teamsData = await listTeams();
   const owners = ownershipMap(teamsData);
+  ringWrap.style.display = boardMode === 'ring' ? '' : 'none';
+  el.style.display = boardMode === 'list' ? '' : 'none';
+  if(boardMode === 'ring'){
+    buildBoardRing(document.getElementById('board-ring'), teamsData, {interactive: true, detailEl: document.getElementById('ring-detail')});
+    renderActivityFeed('board-activity-list', 40);
+    return;
+  }
   el.innerHTML = '';
   GROUP_ORDER.forEach(group=>{
     const items = PROPERTIES.filter(p=>p.group===group);
     const gh = document.createElement('div');
     gh.className = 'group-header';
-    gh.innerHTML = `<span class="swatch" style="background:${items[0].color}"></span><span class="group-title">${group}</span>`;
+    gh.innerHTML = `<span class="swatch" style="background:${esc(items[0].color)}"></span><span class="group-title">${esc(group)}</span>`;
     el.appendChild(gh);
     const grid = document.createElement('div');
     grid.className = 'group-grid';
     items.forEach(p=>{
       const owner = owners[p.id];
-      const rent = currentRent(p, owner, teamsData);
+      const due = rentDue(p, owner, teamsData);
       const row = document.createElement('div');
       row.className = 'stop';
       row.innerHTML = `
-        <div class="stop-swatch" style="background:${p.color}"></div>
+        <div class="stop-swatch" style="background:${esc(p.color)}"></div>
         <div class="stop-body">
-          <div class="stop-name">${p.name} ${owner?`<span class="owner-tag theirs">${owner}</span>`:''}</div>
-          <div class="stop-meta">£${p.price} · rent £${rent}</div>
+          <div class="stop-name">${esc(p.name)} ${owner?`<span class="owner-tag theirs">${esc(owner)}</span>`:''}</div>
+          <div class="stop-meta">£${p.price} · rent £${due.rent}${due.boosted?' (Rent Boost)':''}</div>
         </div>`;
       grid.appendChild(row);
     });
@@ -832,18 +1437,18 @@ async function renderLeaderboard(){
   const teams = Object.values(teamsData);
   if(teams.length === 0){ listEl.innerHTML = '<div class="empty">No teams registered yet.</div>'; if(podiumEl) podiumEl.style.display = 'none'; renderActivityFeed('public-activity-list', 15); return; }
   teams.forEach(t=>{
-    const portfolioValue = (t.owned||[]).reduce((sum,id)=>{ const p=PROPERTIES.find(pp=>pp.id===id); return sum+(p?p.price:0); },0);
+    const portfolioValue = ownedIds(t).reduce((sum,id)=>{ const p=PROPERTIES.find(pp=>pp.id===id); return sum+(p?p.price:0); },0);
     t.netWorth = (t.cash||0) + portfolioValue;
   });
-  teams.sort((a,b)=>b.netWorth - a.netWorth);
+  teams.sort((a,b)=>b.netWorth - a.netWorth || String(a.name).localeCompare(String(b.name)));
   if(podiumEl){
     if(config.finalized){
       const medals = ['🥇','🥈','🥉'];
       const podiumHtml = teams.slice(0,3).map((t,i)=>`
         <div style="flex:1; text-align:center; background:${i===0?'var(--ba-blue-dark)':'var(--white)'}; color:${i===0?'var(--white)':'var(--navy)'}; border:1px solid #ddd; border-radius:8px; padding:${i===0?'22px 12px':'14px 10px'}; ${i===0?'order:2;':i===1?'order:1;':'order:3;'}">
           <div style="font-size:${i===0?'34px':'26px'};">${medals[i]}</div>
-          <div style="font-weight:800; font-size:${i===0?'15px':'13px'}; margin-top:4px;">${t.icon?t.icon+' ':''}${t.name}</div>
-          <div style="font-size:11px; opacity:0.8; margin-top:2px;">£${t.netWorth}</div>
+          <div style="font-weight:800; font-size:${i===0?'15px':'13px'}; margin-top:4px;">${esc(t.icon?t.icon+' ':'')}${esc(t.name)}</div>
+          <div style="font-size:11px; opacity:0.8; margin-top:2px;">${fmtMoney(t.netWorth)}</div>
         </div>`).join('');
       podiumEl.innerHTML = `
         <div class="card" style="text-align:center;">
@@ -855,23 +1460,49 @@ async function renderLeaderboard(){
       podiumEl.style.display = 'none';
     }
   }
+  const showLoc = canSeeTeamLocations();
   const rows = teams.map((t,i)=>{
     const lastBought = t.lastPurchase ? t.lastPurchase.name : 'none yet';
     return `<tr>
       <td class="ba-rank-cell ${i===0?'gold':''}">${i+1}</td>
-      <td><strong>${t.icon?t.icon+' ':''}${t.name}</strong></td>
-      <td>${(t.owned||[]).length}</td>
-      <td>£${t.cash||0}</td>
-      <td>${lastBought}</td>
-      <td>${nearestLabelFor(t.lastLocation)}</td>
-      <td style="font-weight:800; color:var(--ba-blue-corp);">£${t.netWorth}</td>
+      <td><strong>${esc(t.icon?t.icon+' ':'')}${esc(t.name)}</strong></td>
+      <td>${ownedIds(t).length}</td>
+      <td>${moneyHtml(t.cash)}</td>
+      <td>${esc(lastBought)}</td>
+      ${showLoc ? `<td>${esc(nearestLabelFor(t.lastLocation))}</td>` : ''}
+      <td style="font-weight:800; color:var(--ba-blue-corp);">${moneyHtml(t.netWorth)}</td>
     </tr>`;
   }).join('');
   listEl.innerHTML = `<div class="scroll-x"><table class="ba-table">
-    <thead><tr><th></th><th>Team</th><th>Owned</th><th>Cash</th><th>Last bought</th><th>Last seen</th><th>Net worth</th></tr></thead>
+    <thead><tr><th></th><th>Team</th><th>Owned</th><th>Cash</th><th>Last bought</th>${showLoc ? '<th>Last seen</th>' : ''}<th>Net worth</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
+  renderLeaderboardMap(teams, showLoc);
   renderActivityFeed('public-activity-list', 15);
+}
+// Per-game choice (Admin → Event settings): can teams and spectators see where other teams are?
+// The organiser always can.
+function canSeeTeamLocations(){ return currentRole === 'admin' || !!config.showTeamLocations; }
+let lbMap = null, lbLayer = null;
+function renderLeaderboardMap(teams, show){
+  const card = document.getElementById('lb-map-card');
+  if(!card) return;
+  card.style.display = show ? 'block' : 'none';
+  if(!show) return;
+  if(!lbMap){
+    lbMap = L.map('lb-map').setView([51.510, -0.125], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(lbMap);
+    lbLayer = L.layerGroup().addTo(lbMap);
+  }
+  lbLayer.clearLayers();
+  teams.forEach(t=>{
+    if(!t.lastLocation) return;
+    const stale = (Date.now() - t.lastLocation.ts) > 300000;
+    const marker = L.marker([t.lastLocation.lat, t.lastLocation.lng], {icon: makeTeamPinIcon(stale, esc(t.icon))});
+    marker.bindTooltip(esc((t.icon?t.icon+' ':'') + t.name), {permanent:true, direction:'top', className:'team-label', offset:[0,-22]});
+    marker.addTo(lbLayer);
+  });
+  setTimeout(()=>lbMap.invalidateSize(), 60);
 }
 document.getElementById('lb-refresh-btn').addEventListener('click', renderLeaderboard);
 
@@ -881,19 +1512,21 @@ document.getElementById('cfg-save-btn').addEventListener('click', async ()=>{
   config.geofenceRadius = parseInt(document.getElementById('cfg-radius').value) || DEFAULT_CONFIG.geofenceRadius;
   config.eventEnd = document.getElementById('cfg-end').value || null;
   config.adminPasscode = document.getElementById('cfg-passcode').value || DEFAULT_CONFIG.adminPasscode;
-  const sLat = parseFloat(document.getElementById('cfg-start-lat').value);
-  const sLng = parseFloat(document.getElementById('cfg-start-lng').value);
-  config.startPoint = (!isNaN(sLat) && !isNaN(sLng)) ? {lat:sLat, lng:sLng} : DEFAULT_CONFIG.startPoint;
+  config.showTeamLocations = document.getElementById('cfg-show-locations').checked;
+  config.organiserContact = document.getElementById('cfg-contact').value.trim();
+  config.cardMode = document.getElementById('cfg-card-mode').value;
+  const cardPrice = parseInt(document.getElementById('cfg-card-price').value);
+  config.cardPrice = isNaN(cardPrice) || cardPrice < 0 ? DEFAULT_CONFIG.cardPrice : cardPrice;
+  const newGameName = document.getElementById('cfg-game-name').value.trim();
+  if(newGameName && newGameName !== currentGameName){
+    await db.ref(gamePath('/meta/name')).set(newGameName);
+    currentGameName = newGameName;
+    const envBadge = document.getElementById('env-badge');
+    if(envBadge) envBadge.textContent = currentGameName;
+  }
   await saveConfig();
   document.getElementById('cfg-status').textContent = 'Settings saved.';
   document.getElementById('cfg-status').className = 'status-line good';
-});
-document.getElementById('cfg-start-locate-btn').addEventListener('click', ()=>{
-  if(!navigator.geolocation){ toast('Geolocation not supported.'); return; }
-  navigator.geolocation.getCurrentPosition(pos=>{
-    document.getElementById('cfg-start-lat').value = pos.coords.latitude.toFixed(5);
-    document.getElementById('cfg-start-lng').value = pos.coords.longitude.toFixed(5);
-  }, err=>toast('Could not get location: ' + err.message));
 });
 
 
@@ -921,7 +1554,7 @@ document.getElementById('new-team-btn').addEventListener('click', async ()=>{
     players: playersRaw ? playersRaw.split(',').map(s=>s.trim()).filter(Boolean) : [],
     emergencyContact: {name:ecName, phone:ecPhone},
     cash: config.startMoney,
-    visited: {}, owned: [], cardFlags: {}, specialDraws: {}, lastLocation: null, lastPurchase: null,
+    visited: {}, owned: {}, cardFlags: {}, specialDraws: {}, lastPurchase: null,
     createdAt: Date.now()
   };
   await saveTeam(team);
@@ -954,36 +1587,59 @@ document.getElementById('manage-team-select').addEventListener('change', async (
   if(!name){ fieldsEl.style.display = 'none'; return; }
   const team = await loadTeam(name);
   if(!team) return;
+  document.getElementById('edit-team-name').value = team.name || '';
   populateIconSelect(document.getElementById('edit-team-icon'), team.icon);
   document.getElementById('edit-team-pin').value = team.pin || '';
   document.getElementById('edit-team-players').value = (team.players||[]).join(', ');
   document.getElementById('edit-team-ec-name').value = (team.emergencyContact && team.emergencyContact.name) || '';
   document.getElementById('edit-team-ec-phone').value = (team.emergencyContact && team.emergencyContact.phone) || '';
   document.getElementById('edit-team-cash').value = team.cash || 0;
+  editTeamLoadedCash = team.cash || 0;
   fieldsEl.style.display = 'block';
 });
+// Cash shown in the form when it was opened. Saving applies only the *difference* the organiser
+// typed (as an increment), so rent the team received in the meantime isn't wiped.
+let editTeamLoadedCash = 0;
 document.getElementById('edit-team-save-btn').addEventListener('click', async ()=>{
-  const name = document.getElementById('manage-team-select').value;
+  let name = document.getElementById('manage-team-select').value;
   if(!name) return;
-  const team = await loadTeam(name);
-  if(!team) return;
-  team.icon = document.getElementById('edit-team-icon').value;
-  team.pin = document.getElementById('edit-team-pin').value.trim() || team.pin;
-  team.players = document.getElementById('edit-team-players').value.split(',').map(s=>s.trim()).filter(Boolean);
-  team.emergencyContact = {name: document.getElementById('edit-team-ec-name').value.trim(), phone: document.getElementById('edit-team-ec-phone').value.trim()};
-  team.cash = parseInt(document.getElementById('edit-team-cash').value) || 0;
-  await saveTeam(team);
-  document.getElementById('edit-team-status').textContent = 'Saved.';
-  document.getElementById('edit-team-status').className = 'status-line good';
+  const statusEl = document.getElementById('edit-team-status');
+  const newName = document.getElementById('edit-team-name').value.trim();
+  if(!newName){ statusEl.textContent = 'Team name is required.'; statusEl.className = 'status-line err'; return; }
+  if(safeKey(newName) !== safeKey(name) && await loadTeam(newName)){
+    statusEl.textContent = 'A team with that name already exists.'; statusEl.className = 'status-line err'; return;
+  }
+  if(!await loadTeam(name)) return;
+  const renamed = newName !== name;
+  if(renamed){ await renameTeam(name, newName); name = newName; }
+  const typedCash = parseInt(document.getElementById('edit-team-cash').value);
+  const delta = isNaN(typedCash) ? 0 : typedCash - editTeamLoadedCash;
+  const fields = {
+    icon: document.getElementById('edit-team-icon').value,
+    players: document.getElementById('edit-team-players').value.split(',').map(s=>s.trim()).filter(Boolean),
+    emergencyContact: {name: document.getElementById('edit-team-ec-name').value.trim(), phone: document.getElementById('edit-team-ec-phone').value.trim()}
+  };
+  const pin = document.getElementById('edit-team-pin').value.trim();
+  if(pin) fields.pin = pin;
+  if(delta) fields.cash = inc(delta);
+  await db.ref(teamPath(name)).update(fields);
+  if(delta){
+    await logActivity('admin_cash', name, {delta});
+    editTeamLoadedCash = typedCash;
+  }
+  statusEl.textContent = (renamed ? `Saved — renamed to "${newName}". Their team link still works.` : 'Saved.') + (delta ? ` Cash ${delta>0?'+':'-'}£${Math.abs(delta)} (logged).` : '');
+  statusEl.className = 'status-line good';
+  if(renamed){
+    await populateManageTeamSelect();
+    document.getElementById('manage-team-select').value = newName;
+  }
   renderTeamLinks(); renderTracking(); renderLeaderboard();
 });
 document.getElementById('edit-team-unlock-btn').addEventListener('click', async ()=>{
   const name = document.getElementById('manage-team-select').value;
   if(!name) return;
-  const team = await loadTeam(name);
-  if(!team) return;
-  team.lockedDeviceId = null;
-  await saveTeam(team);
+  if(!await loadTeam(name)) return;
+  await db.ref(teamPath(name, 'lockedDeviceId')).remove();
   document.getElementById('edit-team-status').textContent = 'Device unlocked — they can sign in on a new device now.';
   document.getElementById('edit-team-status').className = 'status-line good';
 });
@@ -991,11 +1647,13 @@ document.getElementById('edit-team-reset-btn').addEventListener('click', async (
   const name = document.getElementById('manage-team-select').value;
   if(!name) return;
   if(!confirm(`Reset ${name}'s progress? This clears their cash, properties and visits back to the start — players and PIN are kept.`)) return;
-  const team = await loadTeam(name);
-  if(!team) return;
-  team.cash = config.startMoney;
-  team.visited = {}; team.owned = []; team.cardFlags = {}; team.specialDraws = {}; team.lastPurchase = null;
-  await saveTeam(team);
+  if(!await loadTeam(name)) return;
+  await db.ref(teamPath(name)).update({cash: config.startMoney, visited: null, owned: null, cardFlags: null, specialDraws: null, lastPurchase: null, cardsBought: null});
+  // Logged so a later recalculation from the log replays the reset instead of undoing it.
+  await logActivity('team_reset', name, {startMoney: config.startMoney});
+  await rebuildOwnershipIndex();
+  editTeamLoadedCash = config.startMoney;
+  document.getElementById('edit-team-cash').value = config.startMoney;
   document.getElementById('edit-team-status').textContent = "Team progress reset.";
   document.getElementById('edit-team-status').className = 'status-line good';
   renderLeaderboard();
@@ -1011,21 +1669,26 @@ async function renderTeamLinks(){
   const base = window.location.origin + window.location.pathname;
   el.innerHTML = '';
   for(const t of teams){
-    if(!t.token){ t.token = generateToken(); await saveTeam(t); }
+    if(!t.token){ t.token = generateToken(); await db.ref(teamPath(t.name, 'token')).set(t.token); }
     const link = base + '?game=' + encodeURIComponent(currentGameId) + '&team=' + encodeURIComponent(t.token);
     const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=' + encodeURIComponent(link);
+    const label = (t.icon?t.icon+' ':'') + t.name;
     const row = document.createElement('div');
-    row.className = 'track-row';
-    row.style.alignItems = 'center';
+    row.className = 'track-row team-link-row';
     row.innerHTML = `
-      <img src="${qrUrl}" alt="QR code for ${t.name}" width="44" height="44" style="border-radius:4px; border:1px solid #ddd; flex-shrink:0;">
-      <div class="track-name" style="flex:0 0 120px;">${t.icon?t.icon+' ':''}${t.name}</div>
-      <input type="text" readonly value="${link}" style="flex:1; font-size:11px; padding:6px 8px; border-radius:6px; border:1px solid var(--grey1);" onclick="this.select()">
-      <button class="btn secondary" data-copy-link="${link}" style="padding:6px 10px; font-size:11px; flex-shrink:0;">Copy</button>
-      <a class="btn secondary" href="${qrUrl.replace('120x120','400x400')}" target="_blank" style="padding:6px 10px; font-size:11px; flex-shrink:0; text-decoration:none;">Print QR</a>
+      <img src="${esc(qrUrl)}" alt="QR code for ${esc(t.name)}" title="Click to enlarge" data-qr-big="${esc(qrUrl.replace('120x120','600x600'))}" data-qr-name="${esc(label)}" width="44" height="44" style="border-radius:4px; border:1px solid #ddd; flex-shrink:0; cursor:zoom-in;">
+      <div class="track-name team-link-name">${esc(label)}</div>
+      <input type="text" readonly value="${esc(link)}" class="team-link-input" onclick="this.select()">
+      <div class="team-link-btns">
+        <button class="btn secondary" data-copy-link="${esc(link)}">Copy</button>
+        <a class="btn secondary" href="${esc(qrUrl.replace('120x120','400x400'))}" target="_blank" style="text-decoration:none;">Print QR</a>
+      </div>
     `;
     el.appendChild(row);
   }
+  el.querySelectorAll('[data-qr-big]').forEach(img=>{
+    img.addEventListener('click', ()=>showQrLightbox(img.dataset.qrBig, img.dataset.qrName));
+  });
   el.querySelectorAll('[data-copy-link]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
       try{ await navigator.clipboard.writeText(btn.dataset.copyLink); toast('Link copied.'); }
@@ -1034,6 +1697,19 @@ async function renderTeamLinks(){
   });
 }
 document.getElementById('team-links-refresh-btn').addEventListener('click', renderTeamLinks);
+function showQrLightbox(src, name){
+  const overlay = document.createElement('div');
+  overlay.className = 'qr-lightbox';
+  overlay.innerHTML = `<div class="qr-lightbox-inner"><div class="qr-lightbox-name"></div><img alt=""><div class="small-note">Click anywhere or press Esc to close</div></div>`;
+  overlay.querySelector('.qr-lightbox-name').textContent = name;
+  overlay.querySelector('img').src = src;
+  overlay.querySelector('img').alt = 'QR code for ' + name;
+  const close = ()=>{ overlay.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = e=>{ if(e.key === 'Escape') close(); };
+  overlay.addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(overlay);
+}
 
 // ================= CHANCE CARDS MANAGER (per game) =================
 let editingCardId = null;
@@ -1050,9 +1726,9 @@ function renderCardsManager(){
     if(c.cash != null) effectLabel = (c.cash>=0?'+£':'-£') + Math.abs(c.cash);
     else if(c.flag) effectLabel = c.flag === 'fineImmunity' ? 'Fine Immunity' : 'Rent Boost';
     else if(c.type === 'auction') effectLabel = 'Triggers auction';
-    return `<div class="track-row"><div class="track-name" style="flex:1;">${c.text} <span style="color:var(--ba-warm-grey); font-weight:400;">(${effectLabel})</span></div>
-      <button class="btn secondary" data-edit-card="${c.id}" style="padding:4px 8px; font-size:10.5px;">Edit</button>
-      <button class="btn danger" data-delete-card="${c.id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
+    return `<div class="track-row"><div class="track-name" style="flex:1;">${esc(c.text)} <span style="color:var(--ba-warm-grey); font-weight:400;">(${esc(effectLabel)})</span></div>
+      <button class="btn secondary" data-edit-card="${esc(c.id)}" style="padding:4px 8px; font-size:10.5px;">Edit</button>
+      <button class="btn danger" data-delete-card="${esc(c.id)}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
   }).join('');
   el.querySelectorAll('[data-delete-card]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -1127,7 +1803,7 @@ document.getElementById('add-card-btn').addEventListener('click', async ()=>{
 
 async function renderTracking(){
   const el = document.getElementById('tracking-list');
-  el.innerHTML = '<div class="empty">Loading…</div>';
+  if(!el.children.length) el.innerHTML = '<div class="empty">Loading…</div>';
   const teamsData = await listTeams();
   const teams = Object.values(teamsData);
   renderTeamMarkersOnMap(teamsData);
@@ -1140,10 +1816,10 @@ async function renderTracking(){
       ? `${t.emergencyContact.name||''} ${t.emergencyContact.phone?('· '+t.emergencyContact.phone):''}` : 'not set';
     return `<tr>
       <td><span class="track-dot ${stale?'stale':''}"></span></td>
-      <td><strong>${t.icon?t.icon+' ':''}${t.name}</strong><br><span style="color:var(--ba-warm-grey); font-size:10px;">PIN ${t.pin||'—'}</span></td>
-      <td style="font-size:10.5px; color:var(--ba-warm-grey);">${(t.players||[]).join(', ')||'no players listed'}</td>
+      <td><strong>${esc(t.icon?t.icon+' ':'')}${esc(t.name)}</strong><br><span style="color:var(--ba-warm-grey); font-size:10px;">PIN ${esc(t.pin||'—')}</span></td>
+      <td style="font-size:10.5px; color:var(--ba-warm-grey);">${esc((t.players||[]).join(', ')||'no players listed')}</td>
       <td>${loc?fmtAgo(loc.ts):'no signal'}</td>
-      <td style="font-size:10.5px;">${ec}</td>
+      <td style="font-size:10.5px;">${esc(ec)}</td>
     </tr>`;
   }).join('');
   el.innerHTML = `<div class="scroll-x"><table class="ba-table">
@@ -1161,16 +1837,35 @@ function makeTeamPinIcon(stale, icon){
     iconSize:[26,26], iconAnchor:[13,26]
   });
 }
+// Draws team pins on whichever admin maps exist: the live map on Play control and the
+// Locations map in Game setup.
 function renderTeamMarkersOnMap(teamsData){
-  if(!leafletMap) return; // Locations map hasn't been opened yet this session — nothing to draw on.
-  teamMarkersLayer.clearLayers();
-  Object.values(teamsData).forEach(t=>{
-    if(!t.lastLocation) return;
-    const stale = (Date.now() - t.lastLocation.ts) > 300000;
-    const marker = L.marker([t.lastLocation.lat, t.lastLocation.lng], {icon: makeTeamPinIcon(stale, t.icon)});
-    marker.bindTooltip((t.icon?t.icon+' ':'') + t.name + (stale ? ' (no signal)' : ''), {permanent:true, direction:'top', className:'team-label', offset:[0,-22]});
-    marker.addTo(teamMarkersLayer);
+  [teamMarkersLayer, adminLiveLayer].forEach(layer=>{
+    if(!layer) return;
+    layer.clearLayers();
+    Object.values(teamsData).forEach(t=>{
+      if(!t.lastLocation) return;
+      const stale = (Date.now() - t.lastLocation.ts) > 300000;
+      const marker = L.marker([t.lastLocation.lat, t.lastLocation.lng], {icon: makeTeamPinIcon(stale, esc(t.icon))});
+      marker.bindTooltip(esc((t.icon?t.icon+' ':'') + t.name + (stale ? ' (no signal)' : '')), {permanent:true, direction:'top', className:'team-label', offset:[0,-22]});
+      marker.addTo(layer);
+    });
   });
+}
+function ensureAdminLiveMap(){
+  if(adminLiveMap){ setTimeout(()=>adminLiveMap.invalidateSize(), 60); return; }
+  adminLiveMap = L.map('admin-live-map').setView([51.510, -0.125], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(adminLiveMap);
+  const stopsLayer = L.layerGroup().addTo(adminLiveMap);
+  ALL_POINTS.forEach(item=>{
+    const {lat,lng} = getLatLng(item);
+    const isSpecial = item.type === 'special';
+    const icon = L.divIcon({className:'', html:`<div style="width:10px;height:10px;border-radius:50%;background:${isSpecial?'var(--red)':esc(item.color)};border:2px solid white;box-shadow:0 1px 3px rgba(0,0,0,0.4);"></div>`, iconSize:[10,10], iconAnchor:[5,5]});
+    L.marker([lat,lng], {icon, title:item.name}).addTo(stopsLayer);
+  });
+  if(config.lunchPoint) plotLunchPoint(stopsLayer, false);
+  adminLiveLayer = L.layerGroup().addTo(adminLiveMap);
+  setTimeout(()=>adminLiveMap.invalidateSize(), 60);
 }
 function plotStartPoint(targetLayer){
   const sp = (config.startPoint) || DEFAULT_CONFIG.startPoint;
@@ -1179,10 +1874,48 @@ function plotStartPoint(targetLayer){
     html:`<div style="width:16px;height:16px;border-radius:50%;background:var(--navy);border:2px solid white;box-shadow:0 1px 4px rgba(0,0,0,0.5);"></div>`,
     iconSize:[16,16], iconAnchor:[8,8]
   });
-  const marker = L.marker([sp.lat, sp.lng], {icon, title:'Starting location'});
+  const editable = targetLayer === leafletMarkersLayer;
+  const marker = L.marker([sp.lat, sp.lng], {icon, title:'Starting location', draggable: editable});
   marker.bindTooltip('START', {permanent:true, direction:'top', className:'team-label', offset:[0,-12]});
+  if(editable) marker.on('dragend', e=>setSpecialPoint('start', e.target.getLatLng()));
   marker.addTo(targetLayer);
 }
+function plotLunchPoint(targetLayer, draggable = true){
+  const lp = config.lunchPoint;
+  if(!lp) return;
+  const icon = L.divIcon({
+    className:'',
+    html:`<div style="width:24px;height:24px;border-radius:50%;background:var(--white);border:2px solid var(--navy);box-shadow:0 1px 4px rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;font-size:13px;">🍽️</div>`,
+    iconSize:[24,24], iconAnchor:[12,12]
+  });
+  const marker = L.marker([lp.lat, lp.lng], {icon, title:'Lunch spot', draggable});
+  marker.bindTooltip('LUNCH', {permanent:true, direction:'top', className:'team-label', offset:[0,-14]});
+  if(draggable) marker.on('dragend', e=>setSpecialPoint('lunch', e.target.getLatLng()));
+  marker.addTo(targetLayer);
+}
+// Start / lunch placement on the admin Locations map
+let placingPoint = null;
+function setPlacingPoint(kind){
+  placingPoint = (placingPoint === kind) ? null : kind;
+  document.getElementById('place-start-btn').classList.toggle('active', placingPoint==='start');
+  document.getElementById('place-lunch-btn').classList.toggle('active', placingPoint==='lunch');
+  const statusEl = document.getElementById('special-points-status');
+  statusEl.textContent = placingPoint ? `Click on the map to drop the ${placingPoint==='start'?'START':'LUNCH'} pin.` : '';
+  statusEl.className = 'status-line';
+  if(leafletMap) leafletMap.getContainer().style.cursor = placingPoint ? 'crosshair' : '';
+}
+async function setSpecialPoint(kind, latlng){
+  const pt = {lat: +latlng.lat.toFixed(6), lng: +latlng.lng.toFixed(6)};
+  if(kind === 'start') config.startPoint = pt; else config.lunchPoint = pt;
+  await saveConfig();
+  renderLocationsMap();
+  renderMeetupPointSummary();
+  const statusEl = document.getElementById('special-points-status');
+  statusEl.textContent = `${kind==='start'?'Starting location':'Lunch spot'} saved (${pt.lat.toFixed(5)}, ${pt.lng.toFixed(5)}).`;
+  statusEl.className = 'status-line good';
+}
+document.getElementById('place-start-btn').addEventListener('click', ()=>{ ensureLeafletMap(); setPlacingPoint('start'); });
+document.getElementById('place-lunch-btn').addEventListener('click', ()=>{ ensureLeafletMap(); setPlacingPoint('lunch'); });
 
 // ================= PLAYER'S OWN MAP =================
 function ensurePlayerMap(){
@@ -1190,37 +1923,55 @@ function ensurePlayerMap(){
   playerMap = L.map('player-map').setView([51.510,-0.125], 14);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OpenStreetMap contributors'}).addTo(playerMap);
   playerMarkersLayer = L.layerGroup().addTo(playerMap);
+  setTimeout(()=>{ if(playerMap) playerMap.invalidateSize(); }, 60);
 }
+// Markers refresh on every update, but the view only re-centres on the first GPS fix or when the
+// player taps "Centre on me" — so they can pan around freely.
 function renderPlayerMap(){
   if(!currentTeam) return;
   ensurePlayerMap();
   playerMarkersLayer.clearLayers();
-  currentTeam.visited = currentTeam.visited || {};
+  const visitedMap = currentTeam.visited || {};
   PROPERTIES.forEach(p=>{
     const {lat,lng} = getLatLng(p);
-    const visited = currentTeam.visited[p.id];
+    const visited = visitedMap[p.id];
     const size = 12;
-    const icon = L.divIcon({className:'', html:`<div style="width:${size}px;height:${size}px;border-radius:50%;background:${p.color};border:2px solid ${visited?'#2E5C99':'white'};opacity:${visited?0.5:1};"></div>`, iconSize:[size,size], iconAnchor:[size/2,size/2]});
+    const icon = L.divIcon({className:'', html:`<div style="width:${size}px;height:${size}px;border-radius:50%;background:${esc(p.color)};border:2px solid ${visited?'#2E5C99':'white'};opacity:${visited?0.5:1};"></div>`, iconSize:[size,size], iconAnchor:[size/2,size/2]});
     L.marker([lat,lng], {icon, title:p.name}).addTo(playerMarkersLayer);
   });
   plotStartPoint(playerMarkersLayer);
-  if(currentPosition){
-    if(playerMeMarker){ playerMeMarker.setLatLng([currentPosition.latitude, currentPosition.longitude]); }
-    else{ playerMeMarker = L.circleMarker([currentPosition.latitude, currentPosition.longitude], {radius:8, color:'white', weight:2, fillColor:'#CE210F', fillOpacity:1}).addTo(playerMap); }
-    playerMap.panTo([currentPosition.latitude, currentPosition.longitude]);
+  if(config.showTeamLocations){
+    Object.values(teamsCache).forEach(t=>{
+      const k = safeKey(t.name);
+      const pos = positionsCache[k];
+      if(k === myTeamKey || !pos) return;
+      const stale = (Date.now() - pos.ts) > 300000;
+      const m = L.marker([pos.lat, pos.lng], {icon: makeTeamPinIcon(stale, esc(t.icon))});
+      m.bindTooltip(esc((t.icon?t.icon+' ':'') + t.name), {direction:'top', className:'team-label', offset:[0,-22]});
+      m.addTo(playerMarkersLayer);
+    });
   }
-  setTimeout(()=>{ if(playerMap) playerMap.invalidateSize(); }, 60);
+  if(currentPosition){
+    const here =[currentPosition.latitude, currentPosition.longitude];
+    if(playerMeMarker){ playerMeMarker.setLatLng(here); }
+    else{ playerMeMarker = L.circleMarker(here, {radius:8, color:'white', weight:2, fillColor:'#CE210F', fillOpacity:1}).addTo(playerMap); }
+    if(!playerMapCentred){ playerMap.setView(here, 16); playerMapCentred = true; }
+  }
 }
+document.getElementById('centre-me-btn').addEventListener('click', ()=>{
+  if(!currentPosition || !playerMap){ toast('Still waiting for your location.'); return; }
+  playerMap.setView([currentPosition.latitude, currentPosition.longitude], Math.max(playerMap.getZoom(), 16));
+});
 document.getElementById('open-google-maps-btn').addEventListener('click', ()=>{
   const n = getNearestRemaining();
   if(!n){ toast('No remaining stops to navigate to.'); return; }
-  const c = getLatLng(n);
-  window.open(`https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lng}`, '_blank');
+  const c = getLatLng(n.stop);
+  window.open(`https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lng}&travelmode=walking`, '_blank');
 });
 document.getElementById('open-apple-maps-btn').addEventListener('click', ()=>{
   const n = getNearestRemaining();
   if(!n){ toast('No remaining stops to navigate to.'); return; }
-  const c = getLatLng(n);
+  const c = getLatLng(n.stop);
   window.open(`https://maps.apple.com/?daddr=${c.lat},${c.lng}&dirflg=w`, '_blank');
 });
 
@@ -1233,10 +1984,11 @@ document.getElementById('snapshot-btn').addEventListener('click', async ()=>{
 
 // ================= AUCTIONS =================
 async function startAuction(){
-  const teamsData = await listTeams();
+  const teamsData = Object.keys(teamsCache).length ? teamsCache : await listTeams();
   const owners = ownershipMap(teamsData);
   const unowned = PROPERTIES.filter(p=>!owners[p.id]);
   const pool = unowned.length ? unowned : PROPERTIES;
+  if(pool.length === 0) return;
   const prop = pool[Math.floor(Math.random()*pool.length)];
   const auctionObj = {
     propertyId: prop.id,
@@ -1247,8 +1999,12 @@ async function startAuction(){
     resolved: false
   };
   const ref = db.ref(gamePath('/activeAuction'));
-  await ref.transaction(current => (current && !current.resolved) ? current : auctionObj);
+  // Returning undefined aborts — an auction already running is left alone.
+  await ref.transaction(current => (current && !current.resolved) ? undefined : auctionObj);
 }
+// Bids are stored as {amount, ts}; older ones were bare numbers.
+function bidAmount(b){ return typeof b === 'number' ? b : (b && b.amount) || 0; }
+function bidTs(b){ return (b && typeof b === 'object' && b.ts) || 0; }
 function renderAuctionUI(auction){
   const card = document.getElementById('auction-card');
   const body = document.getElementById('auction-body');
@@ -1257,7 +2013,7 @@ function renderAuctionUI(auction){
   if(!auction){ card.style.display = 'none'; return; }
   if(auction.resolved){
     card.style.display = 'block';
-    body.innerHTML = `<div>${(auction.result && auction.result.text) || 'Auction resolved.'}</div><div class="btn-row"><button class="btn secondary" id="auction-dismiss-btn" style="background:white;color:var(--red);">Dismiss</button></div>`;
+    body.innerHTML = `<div>${esc((auction.result && auction.result.text) || 'Auction closed — working out the winner…')}</div><div class="btn-row"><button class="btn secondary" id="auction-dismiss-btn" style="background:white;color:var(--red);">Dismiss</button></div>`;
     const dbtn = document.getElementById('auction-dismiss-btn');
     if(dbtn) dbtn.addEventListener('click', ()=>{ card.style.display='none'; });
     return;
@@ -1267,117 +2023,174 @@ function renderAuctionUI(auction){
   card.style.display = 'block';
   const myKey = currentTeam ? safeKey(currentTeam.name) : null;
   function render(){
-    const myBid = myKey && auction.bids ? auction.bids[myKey] : null;
+    const myBid = myKey && auction.bids && auction.bids[myKey] != null ? bidAmount(auction.bids[myKey]) : null;
     const msLeft = auction.endTs - Date.now();
     if(msLeft <= 0){
-      body.innerHTML = `<div>Bidding closed for ${prop.name} — resolving…</div>`;
-      tryResolveAuction();
+      body.innerHTML = `<div>Bidding closed for ${esc(prop.name)} — resolving…</div>`;
+      maybeResolveAuction();
       return;
     }
     const mm = Math.floor(msLeft/60000), ss = Math.floor((msLeft%60000)/1000);
+    const timeEl = document.getElementById('auction-time');
+    // Only rebuild the form once — otherwise the bid input would be wiped every second.
+    if(timeEl && body.dataset.bidState === String(myBid)){ timeEl.textContent = `${mm}:${String(ss).padStart(2,'0')}`; return; }
+    body.dataset.bidState = String(myBid);
     body.innerHTML = `
-      <div>Sealed-bid auction for <strong>${prop.name}</strong>${auction.ownerAtStart ? (' (currently owned by '+auction.ownerAtStart+')') : ' (unowned)'}. Closes in ${mm}:${String(ss).padStart(2,'0')}.</div>
+      <div>Sealed-bid auction for <strong>${esc(prop.name)}</strong>${auction.ownerAtStart ? (' (currently owned by '+esc(auction.ownerAtStart)+')') : ' (unowned)'}. Closes in <span id="auction-time">${mm}:${String(ss).padStart(2,'0')}</span>. Highest bid wins; ties go to whoever bid first.</div>
       ${myBid != null
         ? `<div style="margin-top:8px;">Your sealed bid: £${myBid} ✓</div>`
         : `<label class="field-label" style="color:rgba(255,255,255,0.85);">Your sealed bid (£)</label>
-           <input type="number" id="auction-bid-input" min="0">
+           <input type="number" id="auction-bid-input" min="0" inputmode="numeric">
            <div class="btn-row"><button class="btn" id="auction-bid-btn" style="background:white;color:var(--red);">Submit bid</button></div>`}
     `;
     if(myBid == null){
       const bidBtn = document.getElementById('auction-bid-btn');
-      if(bidBtn) bidBtn.addEventListener('click', submitAuctionBid);
+      if(bidBtn) bidBtn.addEventListener('click', ()=>submitAuctionBid(bidBtn));
     }
   }
+  delete body.dataset.bidState;
   render();
   auctionTimerInterval = setInterval(render, 1000);
 }
-async function submitAuctionBid(){
+async function submitAuctionBid(btn){
   if(!currentTeam) return;
   const input = document.getElementById('auction-bid-input');
   const val = parseInt(input ? input.value : '');
   if(isNaN(val) || val < 0){ toast('Enter a valid bid.'); return; }
-  if(val > currentTeam.cash){ toast('You cannot bid more than your current cash.'); return; }
+  if(isGameLocked()){ toast(lockedMessage()); return; }
+  if(val > (currentTeam.cash||0)){ toast('You cannot bid more than your current cash.'); return; }
+  if(btn) btn.disabled = true;
+  const myKey = safeKey(currentTeam.name);
   const ref = db.ref(gamePath('/activeAuction'));
-  await ref.transaction(current=>{
-    if(!current || current.resolved) return current;
+  const tx = await ref.transaction(current=>{
+    if(current === null) return null;
+    if(current.resolved || Date.now() >= current.endTs) return;
+    if(current.bids && current.bids[myKey] != null) return;
     current.bids = current.bids || {};
-    current.bids[safeKey(currentTeam.name)] = val;
+    current.bids[myKey] = {amount: val, ts: Date.now()};
     return current;
   });
-  toast('Bid submitted.');
+  const a = tx.snapshot && tx.snapshot.val();
+  if(tx.committed && a && a.bids && a.bids[myKey] != null) toast('Bid submitted.');
+  else{ toast('Bidding has closed.'); if(btn) btn.disabled = false; }
 }
+let lastResolveAttempt = 0;
+function maybeResolveAuction(){
+  if(Date.now() - lastResolveAttempt < 4000) return;
+  lastResolveAttempt = Date.now();
+  tryResolveAuction();
+}
+// Any open screen (team or organiser) may try to close the auction. Only the one whose
+// transaction flips `resolved` to true goes on to settle it — every other attempt aborts
+// (returns undefined), so the winner is charged exactly once.
 async function tryResolveAuction(){
   const ref = db.ref(gamePath('/activeAuction'));
-  const txResult = await ref.transaction(current=>{
-    if(!current || current.resolved) return current;
-    if(Date.now() < current.endTs) return current;
+  let didResolve = false;
+  const tx = await ref.transaction(current=>{
+    didResolve = false;
+    if(current === null) return null;
+    if(current.resolved || Date.now() < current.endTs) return;
     current.resolved = true;
+    current.resolvedAt = Date.now();
+    didResolve = true;
     return current;
   });
-  if(!txResult.committed) return;
-  const auction = txResult.snapshot.val();
-  if(!auction) return;
-  const settleRef = db.ref(gamePath('/activeAuction/_settledFlag'));
-  const settleTx = await settleRef.transaction(cur => cur ? cur : true);
-  if(!settleTx.committed) return;
-
+  if(!tx.committed || !didResolve) return;
+  const auction = tx.snapshot.val();
+  if(auction) await settleAuction(auction);
+}
+async function settleAuction(auction){
+  const ref = db.ref(gamePath('/activeAuction'));
   const prop = PROPERTIES.find(p=>p.id===auction.propertyId);
-  const bids = auction.bids || {};
-  let winnerKey = null, winnerAmt = -1;
-  Object.entries(bids).forEach(([k,amt])=>{ if(amt > winnerAmt){ winnerAmt = amt; winnerKey = k; } });
-
+  if(!prop){ await ref.update({result:{text:'Auction cancelled — that property is no longer on the board.'}}); return; }
   const teamsData = await listTeams();
-  let resultText = '';
-  if(!winnerKey || winnerAmt <= 0){
+  const byKey = {};
+  Object.values(teamsData).forEach(t=>{ byKey[safeKey(t.name)] = t; });
+  // Highest bid wins, ties go to the earliest bid. A bid the team can no longer afford is skipped.
+  const bids = Object.entries(auction.bids || {})
+    .map(([k,b])=>({key:k, amount:bidAmount(b), ts:bidTs(b)}))
+    .filter(b=>b.amount > 0)
+    .sort((a,b)=>b.amount - a.amount || a.ts - b.ts);
+  const skipped = [];
+  let winner = null;
+  for(const b of bids){
+    const t = byKey[b.key];
+    if(!t) continue;
+    if((t.cash||0) >= b.amount){ winner = {team:t, amount:b.amount}; break; }
+    skipped.push(t.name);
+  }
+  let resultText;
+  if(!winner){
     resultText = `No valid bids came in — ${prop.name} stays as it was.`;
   } else {
-    const winnerTeam = Object.values(teamsData).find(t=>safeKey(t.name)===winnerKey);
-    if(winnerTeam){
-      const prevOwnerName = auction.ownerAtStart;
-      winnerTeam.cash -= winnerAmt;
-      winnerTeam.owned = winnerTeam.owned || [];
-      if(!winnerTeam.owned.includes(prop.id)) winnerTeam.owned.push(prop.id);
-      winnerTeam.visited = winnerTeam.visited || {};
-      winnerTeam.visited[prop.id] = Date.now();
-      winnerTeam.lastPurchase = {name: prop.name, ts: Date.now()};
-      if(prevOwnerName && prevOwnerName !== winnerTeam.name){
-        const prevOwner = teamsData[prevOwnerName];
-        if(prevOwner){
-          prevOwner.owned = (prevOwner.owned||[]).filter(id=>id!==prop.id);
-          prevOwner.cash += winnerAmt;
-          await saveTeam(prevOwner);
-        }
-        resultText = `${winnerTeam.name} won ${prop.name} for £${winnerAmt} — paid to ${prevOwnerName}.`;
-      } else {
-        resultText = `${winnerTeam.name} won ${prop.name} for £${winnerAmt}.`;
-      }
-      await saveTeam(winnerTeam);
-      await logActivity('auction_won', winnerTeam.name, {propertyId: prop.id, propertyName: prop.name, amount: winnerAmt, prevOwner: (prevOwnerName && prevOwnerName !== winnerTeam.name) ? prevOwnerName : null});
-    }
+    const w = winner.team.name, amt = winner.amount, now = Date.now();
+    const prevOwnerName = ownershipMap(teamsData)[prop.id] || null;
+    const paidToPrev = prevOwnerName && prevOwnerName !== w;
+    const updates = {
+      ['teams/'+safeKey(w)+'/cash']: inc(-amt),
+      ['teams/'+safeKey(w)+'/visited/'+prop.id]: now,
+      ['teams/'+safeKey(w)+'/lastPurchase']: {name: prop.name, ts: now},
+      ['ownership/'+prop.id]: w
+    };
+    if(paidToPrev) updates['teams/'+safeKey(prevOwnerName)+'/cash'] = inc(amt);
+    await db.ref(gamePath('')).update(updates);
+    await addOwned(w, prop.id);
+    if(paidToPrev) await removeOwned(prevOwnerName, prop.id);
+    await logActivity('auction_won', w, {propertyId: prop.id, propertyName: prop.name, amount: amt, prevOwner: paidToPrev ? prevOwnerName : null});
+    resultText = paidToPrev ? `${w} won ${prop.name} for £${amt} — paid to ${prevOwnerName}.` : `${w} won ${prop.name} for £${amt}.`;
   }
-  await db.ref(gamePath('/activeAuction')).update({result:{text: resultText}});
-  setTimeout(()=>{ db.ref(gamePath('/activeAuction')).remove(); }, 20000);
+  if(skipped.length) resultText += ` (Higher bid from ${skipped.join(', ')} skipped — not enough cash.)`;
+  await ref.update({result:{text: resultText}});
+  // Clear it after a while, but only if it's still this auction.
+  setTimeout(()=>{ ref.transaction(cur=>(cur && cur.startTs === auction.startTs) ? null : undefined).catch(()=>{}); }, 20000);
 }
+setInterval(()=>{
+  if(currentRole === 'admin' && latestAuction && !latestAuction.resolved && Date.now() >= latestAuction.endTs) maybeResolveAuction();
+}, 3000);
 
 // ================= HALFWAY MEETUP CHALLENGE =================
-document.getElementById('meetup-locate-btn').addEventListener('click', ()=>{
-  if(!navigator.geolocation){ toast('Geolocation not supported.'); return; }
-  navigator.geolocation.getCurrentPosition(pos=>{
-    document.getElementById('meetup-lat').value = pos.coords.latitude.toFixed(5);
-    document.getElementById('meetup-lng').value = pos.coords.longitude.toFixed(5);
-  }, err=>toast('Could not get location: ' + err.message));
+function meetupFormValues(){
+  return {
+    deadlineStr: document.getElementById('meetup-deadline').value,
+    fineAmount: parseInt(document.getElementById('meetup-fine').value) || 50,
+    radius: parseInt(document.getElementById('meetup-radius').value) || 150,
+    stopAfter: parseInt(document.getElementById('meetup-stop-after').value) || 60
+  };
+}
+function renderMeetupPointSummary(){
+  const el = document.getElementById('meetup-point-summary');
+  if(!el) return;
+  const lp = config.lunchPoint;
+  el.textContent = lp ? `📍 ${lp.lat.toFixed(5)}, ${lp.lng.toFixed(5)} — move it by dragging the LUNCH pin on the Locations map in Game setup.`
+                      : 'Not set yet — place the lunch pin on the Locations map in Game setup.';
+  el.className = 'status-line' + (lp ? ' good' : ' warn');
+}
+function loadMeetupPlanIntoForm(){
+  const plan = config.meetupPlan || {};
+  if(plan.deadlineStr) document.getElementById('meetup-deadline').value = plan.deadlineStr;
+  if(plan.fineAmount) document.getElementById('meetup-fine').value = plan.fineAmount;
+  if(plan.radius) document.getElementById('meetup-radius').value = plan.radius;
+  if(plan.stopAfter) document.getElementById('meetup-stop-after').value = plan.stopAfter;
+  renderMeetupPointSummary();
+}
+document.getElementById('meetup-save-btn').addEventListener('click', async ()=>{
+  config.meetupPlan = meetupFormValues();
+  await saveConfig();
+  const statusEl = document.getElementById('meetup-status');
+  statusEl.textContent = 'Meetup plan saved — press Start challenge on the day.';
+  statusEl.className = 'status-line good';
 });
 document.getElementById('meetup-start-btn').addEventListener('click', async ()=>{
-  const lat = parseFloat(document.getElementById('meetup-lat').value);
-  const lng = parseFloat(document.getElementById('meetup-lng').value);
-  const deadlineStr = document.getElementById('meetup-deadline').value;
-  const fineAmount = parseInt(document.getElementById('meetup-fine').value) || 50;
-  const radius = parseInt(document.getElementById('meetup-radius').value) || 150;
+  const {deadlineStr, fineAmount, radius, stopAfter} = meetupFormValues();
   const statusEl = document.getElementById('meetup-status');
-  if(isNaN(lat) || isNaN(lng) || !deadlineStr){ statusEl.textContent = 'Fill in the meetup point and deadline first.'; statusEl.className='status-line err'; return; }
+  const lp = config.lunchPoint;
+  if(!lp){ statusEl.textContent = 'Place the lunch spot on the Locations map in Game setup first.'; statusEl.className='status-line err'; return; }
+  if(!deadlineStr){ statusEl.textContent = 'Set a deadline first.'; statusEl.className='status-line err'; return; }
+  config.meetupPlan = {deadlineStr, fineAmount, radius, stopAfter};
+  await saveConfig();
   const deadline = new Date(deadlineStr).getTime();
-  await db.ref(gamePath('/meetup')).set({lat, lng, deadline, fineAmount, radius, active:true, teamFineState:{}});
-  statusEl.textContent = 'Meetup challenge started.';
+  await db.ref(gamePath('/meetup')).set({lat: lp.lat, lng: lp.lng, deadline, endsAt: deadline + stopAfter*60000, startedAt: Date.now(), fineAmount, radius, active:true, teamFineState:{}});
+  statusEl.textContent = `Meetup challenge started. Fines stop ${stopAfter} minutes after the deadline.`;
   statusEl.className = 'status-line good';
 });
 document.getElementById('meetup-cancel-btn').addEventListener('click', async ()=>{
@@ -1385,97 +2198,147 @@ document.getElementById('meetup-cancel-btn').addEventListener('click', async ()=
   document.getElementById('meetup-status').textContent = 'Meetup challenge cancelled.';
   document.getElementById('meetup-status').className = 'status-line';
 });
-function renderMeetupCard(m, deadlinePassed, arrived, dist){
+function meetupEndTs(m){ return m.endsAt || (m.deadline + 60*60000); }
+// Number of 5-minute fines owed if the clock stopped at `stopAt`. The first lands at the deadline.
+function meetupFinesDue(m, stopAt){
+  if(stopAt <= m.deadline) return 0;
+  return Math.floor((stopAt - m.deadline) / 300000) + 1;
+}
+// Charges whatever meetup fines one team owes. Safe to call from that team's phone and the
+// organiser's screen at once — the transaction on teamFineState decides who charges what.
+// The fine clock stops at the team's first arrival (arrivedAt), so walking on afterwards
+// costs nothing, and at the meetup's end time.
+async function applyMeetupFines(m, teamName, pos){
+  const key = safeKey(teamName);
+  const now = Date.now();
+  const inRange = !!pos && haversine(pos.lat, pos.lng, m.lat, m.lng) <= (m.radius || 150);
+  let delta = 0;
+  const tx = await db.ref(gamePath('/meetup/teamFineState/'+key)).transaction(cur=>{
+    delta = 0;
+    const state = cur || {};
+    const arrivedAt = state.arrivedAt || (inRange ? Math.min(pos.ts || now, now) : null);
+    const stopAt = Math.min(arrivedAt || Infinity, meetupEndTs(m), now);
+    const applied = state.finesApplied || 0;
+    delta = Math.max(0, meetupFinesDue(m, stopAt) - applied);
+    if(!delta && arrivedAt === (state.arrivedAt || null)) return;
+    return {...state, arrivedAt: arrivedAt || null, finesApplied: applied + delta};
+  });
+  if(!tx.committed || delta <= 0) return 0;
+  const fineTotal = delta * (m.fineAmount || 50);
+  await db.ref(teamPath(teamName, 'cash')).set(inc(-fineTotal));
+  await logActivity('meetup_fine', teamName, {amount: fineTotal});
+  return fineTotal;
+}
+function renderMeetupCard(m, state, dist){
   const card = document.getElementById('meetup-card');
   const body = document.getElementById('meetup-body');
   if(!card || !body) return;
-  if(!m || !m.active){ card.style.display = 'none'; return; }
+  const now = Date.now();
+  if(!m || !m.active || now > meetupEndTs(m)){ card.style.display = 'none'; return; }
   card.style.display = 'block';
-  if(!deadlinePassed){
-    const msLeft = m.deadline - Date.now();
-    const mins = Math.max(0, Math.floor(msLeft/60000));
-    body.innerHTML = `<div>Everyone needs to meet at the halfway point within ${mins} minute(s) — after that, a rolling fine kicks in every 5 minutes until your team arrives.</div>`;
-  } else if(arrived){
-    body.innerHTML = `<div>✅ You're at the meetup point — no fine.</div>`;
+  state = state || {};
+  if(state.arrivedAt){
+    const fines = (state.finesApplied || 0) * (m.fineAmount || 50);
+    body.innerHTML = `<div>✅ You've checked in at the meetup point${fines ? ` (late fines: £${fines})` : ' — no fine'}. You're free to carry on.</div>`;
+  } else if(now <= m.deadline){
+    const mins = Math.max(0, Math.ceil((m.deadline - now)/60000));
+    body.innerHTML = `<div>Get your whole team to the halfway point within ${mins} minute(s)${dist!=null?` — you're ${fmtDist(dist)} away`:''}. After that, a fine of £${m.fineAmount||50} lands every 5 minutes until you arrive.</div>`;
   } else {
-    body.innerHTML = `<div>⏰ You're ${fmtDist(dist)} from the meetup point and the deadline has passed — a fine is accruing every 5 minutes until you arrive.</div>`;
+    body.innerHTML = `<div>⏰ The deadline has passed and you're ${dist!=null?fmtDist(dist):'some way'} from the meetup point — £${m.fineAmount||50} is added every 5 minutes until you arrive.</div>`;
   }
 }
+let lastMeetupCheck = 0;
+function maybeCheckMeetup(){ if(Date.now() - lastMeetupCheck > 20000) checkMeetupFine(); }
 async function checkMeetupFine(){
   if(!currentTeam || currentRole !== 'team') return;
+  lastMeetupCheck = Date.now();
   try{
     const snap = await db.ref(gamePath('/meetup')).once('value');
-    if(!snap.exists()){ renderMeetupCard(null); return; }
     const m = snap.val();
-    if(!m.active){ renderMeetupCard(m); return; }
-    if(Date.now() < m.deadline){ renderMeetupCard(m, false); return; }
-    const loc = currentTeam.lastLocation;
-    const dist = loc ? haversine(loc.lat, loc.lng, m.lat, m.lng) : Infinity;
-    const arrived = dist <= (m.radius || 150);
-    renderMeetupCard(m, true, arrived, dist);
-    if(arrived) return;
-    const key = safeKey(currentTeam.name);
-    const targetIncrements = Math.floor((Date.now() - m.deadline) / 300000) + 1;
-    const ref = db.ref(gamePath('/meetup/teamFineState/')+key);
-    let appliedDelta = 0;
-    const tx = await ref.transaction(cur=>{
-      const current = (cur && cur.finesApplied) || 0;
-      appliedDelta = Math.max(0, targetIncrements - current);
-      if(appliedDelta <= 0) return cur;
-      return {finesApplied: targetIncrements};
-    });
-    if(tx.committed && appliedDelta > 0){
-      const fineTotal = appliedDelta * (m.fineAmount || 50);
-      currentTeam.cash -= fineTotal;
-      await saveTeam(currentTeam);
-      await logActivity('meetup_fine', currentTeam.name, {amount: fineTotal});
-      refreshWallet();
-      toast(`Meetup fine: -£${fineTotal} for not being at the meetup point.`);
+    if(!m || !m.active){ renderMeetupCard(null); return; }
+    const pos = currentPosition ? {lat:currentPosition.latitude, lng:currentPosition.longitude, ts:Date.now()} : null;
+    const dist = pos ? haversine(pos.lat, pos.lng, m.lat, m.lng) : null;
+    const fined = await applyMeetupFines(m, currentTeam.name, pos);
+    const stateSnap = await db.ref(gamePath('/meetup/teamFineState/'+safeKey(currentTeam.name))).once('value');
+    renderMeetupCard(m, stateSnap.val(), dist);
+    if(fined) toast(`Meetup fine: -£${fined} for not being at the meetup point.`);
+  }catch(e){}
+}
+// Organiser-side sweep: records arrivals from each team's last ping and charges fines for teams
+// whose phone isn't open, so the meetup doesn't depend on every team having the app in front.
+async function sweepMeetupFines(){
+  try{
+    const m = (await db.ref(gamePath('/meetup')).once('value')).val();
+    if(!m || !m.active) return;
+    const teams = await listTeams();
+    for(const t of Object.values(teams)){
+      const loc = t.lastLocation && (!m.startedAt || t.lastLocation.ts >= m.startedAt) ? t.lastLocation : null;
+      await applyMeetupFines(m, t.name, loc);
     }
   }catch(e){}
 }
 setInterval(()=>{ if(currentRole==='team') checkMeetupFine(); }, 60000);
+setInterval(()=>{ if(currentRole==='admin') sweepMeetupFines(); }, 60000);
 setInterval(()=>{ if(currentRole==='admin') saveSnapshot(); }, 3600000);
+
+// ================= GAME START / PAUSE =================
+// Nothing a team does counts until the organiser presses Start game. Pause stops play the same
+// way (e.g. for a safety issue) without ending the game.
+function renderGameStatus(){
+  const el = document.getElementById('game-status-line');
+  const startBtn = document.getElementById('game-start-btn');
+  const pauseBtn = document.getElementById('game-pause-btn');
+  if(!el || !startBtn || !pauseBtn) return;
+  const reason = gameLockReason();
+  const since = config.startedAt ? new Date(config.startedAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
+  const text = {
+    'not-started': 'Not started — teams can sign in and look around, but can\'t buy, pay, draw cards or bid.',
+    'paused': 'Paused — teams can\'t do anything until you start again.',
+    'finalized': 'Finalised — the board is locked.',
+    'ended': 'The event end time has passed — the board is locked.'
+  }[reason] || ('Running since ' + since + '.');
+  el.textContent = text;
+  el.className = 'game-status ' + (reason ? (reason === 'not-started' || reason === 'paused' ? 'waiting' : 'over') : 'running');
+  startBtn.textContent = reason === 'paused' ? 'Resume game' : 'Start game';
+  startBtn.style.display = (reason === 'not-started' || reason === 'paused') ? '' : 'none';
+  pauseBtn.style.display = reason === null ? '' : 'none';
+}
+document.getElementById('game-start-btn').addEventListener('click', async ()=>{
+  const resuming = !!config.startedAt;
+  if(!confirm(resuming ? 'Resume the game? Teams can play again straight away.' : 'Start the game? Teams can buy, pay rent and draw cards from now on.')) return;
+  await db.ref(gamePath('/config')).update({started: true, startedAt: config.startedAt || Date.now()});
+  await logActivity(resuming ? 'game_resumed' : 'game_started', '', {});
+});
+document.getElementById('game-pause-btn').addEventListener('click', async ()=>{
+  if(!confirm('Pause the game? Teams won\'t be able to buy, pay rent, draw cards or bid until you resume.')) return;
+  await db.ref(gamePath('/config/started')).set(false);
+  await logActivity('game_paused', '', {});
+});
 
 document.getElementById('finalize-btn').addEventListener('click', async ()=>{
   if(!confirm('This applies end-of-event fines to every team for unvisited properties and locks the board. Continue?')) return;
-  const teamsData = await listTeams();
-  const owners = ownershipMap(teamsData);
-  for(const t of Object.values(teamsData)){
-    t.visited = t.visited || {};
-    const unvisited = PROPERTIES.filter(p=>!t.visited[p.id]);
-    const fines = unvisited.map(p=>({p, fine: Math.round(1.5*currentRent(p, owners[p.id], teamsData))}));
-    fines.sort((a,b)=>b.fine-a.fine);
-    t.cardFlags = t.cardFlags || {};
-    let immunity = t.cardFlags.fineImmunity || 0;
-    for(const f of fines){
-      if(immunity > 0){ immunity -= 1; continue; }
-      t.cash -= f.fine;
-      await logActivity('finalize_fine', t.name, {propertyId: f.p.id, propertyName: f.p.name, amount: f.fine});
-    }
-    t.cardFlags.fineImmunity = immunity;
-    await saveTeam(t);
+  const statusEl = document.getElementById('finalize-status');
+  const res = await finalizeGameById(currentGameId);
+  if(res.already){
+    statusEl.textContent = 'Already finalised — fines were not applied again. Re-open the board first if you need to redo it.';
+    statusEl.className = 'status-line warn';
+    return;
   }
-  config.finalized = true;
-  await saveConfig();
-  document.getElementById('finalize-status').textContent = 'Event finalised — fines applied, board locked.';
-  document.getElementById('finalize-status').className = 'status-line good';
+  statusEl.textContent = 'Event finalised — fines applied, board locked.';
+  statusEl.className = 'status-line good';
   renderLeaderboard();
 });
 document.getElementById('unlock-board-btn').addEventListener('click', async ()=>{
-  config.finalized = false;
-  await saveConfig();
-  document.getElementById('finalize-status').textContent = 'Board re-opened.';
+  if(!confirm('Re-open the board? Any end-of-event fines from the last Finalise are refunded and their log entries removed.')) return;
+  const res = await unlockGameById(currentGameId);
+  const statusEl = document.getElementById('finalize-status');
+  statusEl.textContent = res.reversed ? 'Board re-opened — end-of-event fines refunded.' : 'Board re-opened.';
+  statusEl.className = 'status-line good';
+  renderLeaderboard();
 });
 document.getElementById('admin-reset-btn').addEventListener('click', async ()=>{
   if(!confirm('This wipes every team, plus the activity log, live auction, meetup challenge, and challenge submissions. Continue?')) return;
-  await db.ref(gamePath('/teams')).remove();
-  await db.ref(gamePath('/activity')).remove();
-  await db.ref(gamePath('/activeAuction')).remove();
-  await db.ref(gamePath('/meetup')).remove();
-  await db.ref(gamePath('/challengeSubmissions')).remove();
-  config.finalized = false;
-  await saveConfig();
+  await resetGameById(currentGameId);
   renderTracking();
   renderLeaderboard();
 });
@@ -1490,6 +2353,12 @@ function ensureLeafletMap(){
   }).addTo(leafletMap);
   leafletMarkersLayer = L.layerGroup().addTo(leafletMap);
   teamMarkersLayer = L.layerGroup().addTo(leafletMap);
+  leafletMap.on('click', e=>{
+    if(!placingPoint) return;
+    const kind = placingPoint;
+    setPlacingPoint(null);
+    setSpecialPoint(kind, e.latlng);
+  });
 }
 function renderLocationsMap(){
   ensureLeafletMap();
@@ -1497,26 +2366,26 @@ function renderLocationsMap(){
   ALL_POINTS.forEach(item=>{
     const {lat,lng} = getLatLng(item);
     const isSpecial = SPECIALS.some(s=>s.id===item.id);
-    const overridden = !!(config.coordOverrides && config.coordOverrides[item.id]);
+    const tpl = templateCoords(item.id);
+    const moved = !!tpl && (Math.abs(tpl.lat-lat) > 1e-6 || Math.abs(tpl.lng-lng) > 1e-6);
     const size = isSpecial ? 18 : 14;
     const icon = L.divIcon({
       className:'',
-      html:`<div style="width:${size}px;height:${size}px;border-radius:50%;background:${isSpecial?'var(--red)':item.color};border:2px solid ${overridden?'var(--blue)':'white'};box-shadow:0 1px 4px rgba(0,0,0,0.5);"></div>`,
+      html:`<div style="width:${size}px;height:${size}px;border-radius:50%;background:${isSpecial?'var(--red)':esc(item.color)};border:2px solid ${moved?'var(--blue)':'white'};box-shadow:0 1px 4px rgba(0,0,0,0.5);"></div>`,
       iconSize:[size,size], iconAnchor:[size/2,size/2]
     });
     const marker = L.marker([lat,lng], {icon, draggable:true, title:item.name});
     marker.on('click', ()=>selectLocationForEdit(item.id));
     marker.on('dragend', async (e)=>{
       const pos = e.target.getLatLng();
-      config.coordOverrides = config.coordOverrides || {};
-      config.coordOverrides[item.id] = {lat:pos.lat, lng:pos.lng};
-      await saveConfig();
+      await setLocationCoords(item.id, pos.lat, pos.lng);
       selectLocationForEdit(item.id);
       toast('Updated location for ' + item.name);
     });
     marker.addTo(leafletMarkersLayer);
   });
   plotStartPoint(leafletMarkersLayer);
+  plotLunchPoint(leafletMarkersLayer);
   setTimeout(()=>{ if(leafletMap) leafletMap.invalidateSize(); }, 60);
 }
 function selectLocationForEdit(id){
@@ -1529,30 +2398,58 @@ function selectLocationForEdit(id){
   document.getElementById('loc-edit-lat').value = lat.toFixed(5);
   document.getElementById('loc-edit-lng').value = lng.toFixed(5);
 }
+// Coordinates have one home: the game's own /locations/{id}. Dragging a pin here and editing in
+// the table editor both write there, so neither can silently override the other.
+function templateCoords(id){
+  const t = MONOPOLY_TEMPLATE_LOCATIONS.find(l=>l.id===id);
+  return t ? {lat:t.lat, lng:t.lng} : null;
+}
+async function setLocationCoords(id, lat, lng){
+  lat = +lat.toFixed(6); lng = +lng.toFixed(6);
+  const ref = db.ref(gamePath('/locations/'+id));
+  if(!(await ref.child('name').once('value')).exists()){ toast('Could not find that location in this game\'s board.'); return; }
+  await ref.update({lat, lng});
+  const item = ALL_POINTS.find(p=>p.id===id);
+  if(item){ item.lat = lat; item.lng = lng; }
+  if(config.coordOverrides && config.coordOverrides[id]){
+    delete config.coordOverrides[id];
+    await db.ref(gamePath('/config/coordOverrides/'+id)).remove();
+  }
+}
+// One-off: fold pins dragged under the old system (config.coordOverrides) into /locations.
+async function migrateCoordOverrides(){
+  const o = config.coordOverrides || {};
+  const ids = Object.keys(o).filter(id=>ALL_POINTS.some(p=>p.id===id));
+  if(!ids.length) return;
+  try{
+    for(const id of ids) await setLocationCoords(id, o[id].lat, o[id].lng);
+  }catch(e){}
+}
 async function saveLocationOverrideFromInputs(){
   if(!selectedMapId) return;
   const lat = parseFloat(document.getElementById('loc-edit-lat').value);
   const lng = parseFloat(document.getElementById('loc-edit-lng').value);
   if(isNaN(lat) || isNaN(lng)) return;
-  config.coordOverrides = config.coordOverrides || {};
-  config.coordOverrides[selectedMapId] = {lat, lng};
-  await saveConfig();
+  await setLocationCoords(selectedMapId, lat, lng);
   renderLocationsMap();
   toast('Updated location for ' + ALL_POINTS.find(p=>p.id===selectedMapId).name);
 }
 document.getElementById('loc-save-btn').addEventListener('click', saveLocationOverrideFromInputs);
 document.getElementById('loc-reset-btn').addEventListener('click', async ()=>{
   if(!selectedMapId) return;
-  if(config.coordOverrides) delete config.coordOverrides[selectedMapId];
-  await saveConfig();
+  const tpl = templateCoords(selectedMapId);
+  if(!tpl){ toast('This is a custom location — there are no default coordinates to go back to.'); return; }
+  await setLocationCoords(selectedMapId, tpl.lat, tpl.lng);
   selectLocationForEdit(selectedMapId);
   renderLocationsMap();
   toast('Reset to default coordinates.');
 });
 document.getElementById('loc-reset-all-btn').addEventListener('click', async ()=>{
-  if(!confirm('Reset every location back to its default coordinates?')) return;
-  config.coordOverrides = {};
-  await saveConfig();
+  if(!confirm('Reset every Monopoly location back to its default coordinates? Custom locations are left alone.')) return;
+  for(const item of ALL_POINTS){
+    const tpl = templateCoords(item.id);
+    if(tpl) await setLocationCoords(item.id, tpl.lat, tpl.lng);
+  }
   document.getElementById('loc-edit-panel').style.display = 'none';
   selectedMapId = null;
   renderLocationsMap();
@@ -1575,6 +2472,12 @@ document.getElementById('loc-locate-btn').addEventListener('click', ()=>{
 async function checkAutoLogin(){
   const params = new URLSearchParams(window.location.search);
   const token = params.get('team');
+  // Big-screen link: sign in as a spectator and go straight to the projector view.
+  if(!token && params.get('screen')){
+    await enterApp('spectator');
+    openBigScreen();
+    return;
+  }
   if(!token) return;
   await loadConfig();
   const teamsData = await listTeams();
@@ -1763,8 +2666,8 @@ async function renderTemplatesList(){
     const val = snap.val();
     const rows = Object.keys(val).map(id=>{
       const meta = val[id].meta || {};
-      return `<div class="track-row"><div class="track-name" style="flex:1;">${meta.name || id} <span style="color:var(--ba-warm-grey); font-weight:400;">(${meta.count||0} locations)</span></div>
-        <button class="btn secondary" data-edit-tpl="${id}" data-edit-tpl-name="${meta.name || id}" style="padding:4px 8px; font-size:10.5px;">Edit</button>
+      return `<div class="track-row"><div class="track-name" style="flex:1;">${esc(meta.name || id)} <span style="color:var(--ba-warm-grey); font-weight:400;">(${meta.count||0} locations)</span></div>
+        <button class="btn secondary" data-edit-tpl="${id}" data-edit-tpl-name="${esc(meta.name || id)}" style="padding:4px 8px; font-size:10.5px;">Edit</button>
         <button class="btn danger" data-delete-tpl="${id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
     }).join('');
     el.innerHTML = rows;
@@ -1789,7 +2692,7 @@ async function populateGameTemplateOptions(){
   const sel = document.getElementById('cc-new-template');
   if(!sel) return;
   const prev = sel.value;
-  sel.innerHTML = '<option value="monopoly-builtin">Monopoly (built-in — 26 London streets)</option>';
+  sel.innerHTML = '<option value="monopoly-builtin">Monopoly (built-in — 26 London streets)</option><option value="blank-custom">Blank — add my own locations</option>';
   try{
     const snap = await db.ref('templates').once('value');
     if(snap.exists()){
@@ -1835,7 +2738,7 @@ async function renderGamesList(){
     try{
       const snap = await db.ref(legacyId+'/config').once('value');
       if(snap.exists()){
-        games.push({id: legacyId, name: legacyId==='live' ? 'Live (existing event)' : 'Test (existing rehearsal)', createdAt: 0, archived: false, legacy: true});
+        games.push({id: legacyId, name: await getGameName(legacyId), createdAt: 0, archived: false, legacy: true});
       }
     }catch(e){}
   }
@@ -1852,7 +2755,7 @@ async function renderGamesList(){
     gameUrl.search = '';
     gameUrl.searchParams.set('game', g.id);
     return `<tr>
-      <td><strong>${g.name}</strong>${g.archived?' <span style="color:var(--ba-warm-grey); font-size:10px;">(archived)</span>':''}</td>
+      <td><strong>${esc(g.name)}</strong>${g.archived?' <span style="color:var(--ba-warm-grey); font-size:10px;">(archived)</span>':''}</td>
       <td>${teamCount}</td>
       <td>${created}</td>
       <td style="white-space:nowrap;">
@@ -1930,7 +2833,7 @@ async function closeLocationEditor(){
       const snap = await db.ref(gamePath('/locations')).once('value');
       const val = snap.val();
       const locations = val ? (Array.isArray(val) ? val.filter(Boolean) : Object.values(val)) : [];
-      if(locations.length) applyLocations(locations);
+      applyLocations(locations);
       renderLocationsMap();
       toast('Board updated with your changes.');
     }catch(e){}
@@ -1954,9 +2857,9 @@ function renderLocEditorTable(){
   if(!el) return;
   if(locEditorLocations.length === 0){ el.innerHTML = '<div class="empty">No locations yet — add one below, import a CSV, or drop pins on the map.</div>'; return; }
   const rows = locEditorLocations.map(l=>`<tr>
-    <td><strong>${l.name}</strong></td>
-    <td>${l.group||''}</td>
-    <td>${l.type}</td>
+    <td><strong>${esc(l.name)}</strong></td>
+    <td>${esc(l.group||'')}</td>
+    <td>${esc(l.type)}</td>
     <td>£${l.price||0}</td>
     <td>${l.lat!=null?l.lat.toFixed(4):'—'}, ${l.lng!=null?l.lng.toFixed(4):'—'}</td>
     <td style="white-space:nowrap;">
@@ -2013,7 +2916,10 @@ document.getElementById('le-save-btn').addEventListener('click', async ()=>{
   const lng = parseFloat(document.getElementById('le-lng').value);
   if(isNaN(lat) || isNaN(lng)){ statusEl.textContent = 'Set coordinates — type them or pick on the map.'; statusEl.className = 'status-line err'; return; }
   const type = document.getElementById('le-type').value;
+  // Start from the existing record so fields the form doesn't show (e.g. wikiTitle for the photo) survive.
+  const existing = locEditorEditingId ? (locEditorLocations.find(l=>l.id===locEditorEditingId) || {}) : {};
   const loc = {
+    ...existing,
     id: locEditorEditingId || genLocId(),
     name,
     group: type==='special' ? 'Special' : (document.getElementById('le-group').value.trim() || 'General'),
@@ -2111,27 +3017,16 @@ document.getElementById('edit-locations-table-btn').addEventListener('click', ()
 // ================= RECALCULATION ENGINE =================
 // Rebuilds every team's cash/ownership/visited state from scratch by
 // replaying the full activity log in order. Used whenever an admin
-// removes a bad log entry, so scores stay trustworthy.
-// Known limitation: bonus-card flags (Fine Immunity / Rent Boost) are
-// re-granted by replay but their *consumption* isn't perfectly replayed
-// (a rent entry's amount already reflects whether a boost was used, so
-// cash stays accurate — but a team's remaining flag count afterwards
-// may not exactly match what it was in the moment). Cash and ownership,
-// the numbers that actually matter for a fairness fix, are exact.
+// removes a bad log entry, so scores stay trustworthy. Organiser cash
+// edits (admin_cash) and per-team resets (team_reset) are logged too, so
+// they replay rather than being lost. Rent or an auction payment to a team
+// that no longer owns the property at that point in the replay (because
+// its purchase was removed) is skipped.
 async function recalculateGameFromLog(){
   const teamsData = await listTeams();
+  const fresh = ()=>({cash: config.startMoney, owned: [], visited: {}, cardFlags: {}, specialDraws: {}, lastPurchase: null, cardsBought: 0});
   const reset = {};
-  Object.values(teamsData).forEach(t=>{
-    reset[t.name] = {
-      ...t,
-      cash: config.startMoney,
-      owned: [],
-      visited: {},
-      cardFlags: {},
-      specialDraws: {},
-      lastPurchase: null
-    };
-  });
+  Object.values(teamsData).forEach(t=>{ reset[t.name] = fresh(); });
   let entries = [];
   try{
     const snap = await db.ref(gamePath('/activity')).once('value');
@@ -2141,11 +3036,13 @@ async function recalculateGameFromLog(){
     }
   }catch(e){}
 
+  const ownerOf = pid=>Object.keys(reset).find(n=>reset[n].owned.includes(pid));
   entries.forEach(e=>{
     const d = e.detail || {};
     const team = reset[e.team];
     if(!team) return;
     if(e.type === 'buy'){
+      if(ownerOf(d.propertyId)) return; // someone already owns it in the replay
       team.cash -= d.price;
       team.owned.push(d.propertyId);
       team.visited[d.propertyId] = e.ts;
@@ -2153,42 +3050,61 @@ async function recalculateGameFromLog(){
     } else if(e.type === 'visit'){
       team.visited[d.propertyId] = e.ts;
     } else if(e.type === 'rent'){
-      team.cash -= d.amount;
       team.visited[d.propertyId] = e.ts;
       const owner = reset[d.owner];
-      if(owner){
+      if(owner && owner.owned.includes(d.propertyId)){
+        team.cash -= d.amount;
         owner.cash += d.amount;
         if(d.boosted && owner.cardFlags.rentBoost > 0) owner.cardFlags.rentBoost -= 1;
       }
-    } else if(e.type === 'chance_cash'){
-      team.cash += d.cash;
-      team.specialDraws[d.specialId] = true;
-    } else if(e.type === 'chance_flag'){
-      team.cardFlags[d.flag] = (team.cardFlags[d.flag]||0) + 1;
-      team.specialDraws[d.specialId] = true;
-    } else if(e.type === 'chance_auction_trigger'){
-      team.specialDraws[d.specialId] = true;
+    } else if(e.type === 'chance_cash' || e.type === 'chance_flag' || e.type === 'chance_auction_trigger'){
+      // A bought card carries its price; a location draw marks that draw point as used.
+      if(e.type === 'chance_cash') team.cash += d.cash;
+      if(e.type === 'chance_flag') team.cardFlags[d.flag] = (team.cardFlags[d.flag]||0) + 1;
+      if(d.bought){ team.cash -= (d.price || 0); team.cardsBought += 1; }
+      if(d.specialId) team.specialDraws[d.specialId] = true;
     } else if(e.type === 'auction_won'){
       team.cash -= d.amount;
+      const prev = d.prevOwner && reset[d.prevOwner];
+      if(prev && prev.owned.includes(d.propertyId)){
+        prev.owned = prev.owned.filter(id=>id!==d.propertyId);
+        prev.cash += d.amount;
+      } else {
+        const holder = ownerOf(d.propertyId);
+        if(holder && holder !== e.team) reset[holder].owned = reset[holder].owned.filter(id=>id!==d.propertyId);
+      }
       if(!team.owned.includes(d.propertyId)) team.owned.push(d.propertyId);
       team.visited[d.propertyId] = e.ts;
       team.lastPurchase = {name: d.propertyName, ts: e.ts};
-      if(d.prevOwner && reset[d.prevOwner]){
-        reset[d.prevOwner].owned = reset[d.prevOwner].owned.filter(id=>id!==d.propertyId);
-        reset[d.prevOwner].cash += d.amount;
-      }
-    } else if(e.type === 'meetup_fine'){
+    } else if(e.type === 'meetup_fine' || e.type === 'finalize_fine'){
       team.cash -= d.amount;
-    } else if(e.type === 'finalize_fine'){
-      team.cash -= d.amount;
+    } else if(e.type === 'fine_immunity_used'){
+      team.cardFlags.fineImmunity = Math.max(0, (team.cardFlags.fineImmunity||0) - (d.count||0));
     } else if(e.type === 'challenge_bonus'){
       team.cash += d.amount;
+    } else if(e.type === 'admin_cash'){
+      team.cash += d.delta;
+    } else if(e.type === 'team_reset'){
+      reset[e.team] = fresh();
+      if(d.startMoney != null) reset[e.team].cash = d.startMoney;
     }
   });
 
-  for(const name of Object.keys(reset)){
-    await saveTeam(reset[name]);
-  }
+  // Write only the scoring fields, so name/PIN/token/device lock aren't touched.
+  const updates = {};
+  Object.keys(reset).forEach(name=>{
+    const r = reset[name], k = safeKey(name);
+    const owned = {}; r.owned.forEach(id=>{ owned[id] = true; });
+    updates['teams/'+k+'/cash'] = r.cash;
+    updates['teams/'+k+'/owned'] = owned;
+    updates['teams/'+k+'/visited'] = r.visited;
+    updates['teams/'+k+'/cardFlags'] = r.cardFlags;
+    updates['teams/'+k+'/specialDraws'] = r.specialDraws;
+    updates['teams/'+k+'/lastPurchase'] = r.lastPurchase;
+    updates['teams/'+k+'/cardsBought'] = r.cardsBought || null;
+  });
+  if(Object.keys(updates).length) await db.ref(gamePath('')).update(updates);
+  await rebuildOwnershipIndex();
 }
 
 // ================= ACTION LOG (admin) =================
@@ -2198,14 +3114,13 @@ function actionLogLine(e){
     case 'buy': return `${e.team} bought ${d.propertyName} for £${d.price}`;
     case 'visit': return `${e.team} visited ${d.propertyName}`;
     case 'rent': return `${e.team} paid £${d.amount} rent on ${d.propertyName} to ${d.owner}${d.boosted?' (doubled)':''}`;
-    case 'chance_cash': return `${e.team} drew "${d.text}" at ${d.locationLabel}`;
-    case 'chance_flag': return `${e.team} drew "${d.text}" at ${d.locationLabel}`;
-    case 'chance_auction_trigger': return `${e.team} triggered an auction at ${d.locationLabel}`;
+    case 'chance_cash': case 'chance_flag':
+      return d.bought ? `${e.team} bought a card for £${d.price}: "${d.text}"` : `${e.team} drew "${d.text}" at ${d.locationLabel}`;
+    case 'chance_auction_trigger': return d.bought ? `${e.team} bought a card for £${d.price} and triggered an auction` : `${e.team} triggered an auction at ${d.locationLabel}`;
     case 'auction_won': return `${e.team} won ${d.propertyName} at auction for £${d.amount}`;
     case 'meetup_fine': return `${e.team} fined £${d.amount} for missing the meetup`;
     case 'finalize_fine': return `${e.team} fined £${d.amount} for not visiting ${d.propertyName}`;
-    case 'challenge_bonus': return `${e.team} awarded £${d.amount} for "${d.challengeTitle}"`;
-    default: return `${e.team||''} ${e.type}`;
+    default: return activityText(e);
   }
 }
 async function renderActionLog(){
@@ -2221,7 +3136,7 @@ async function renderActionLog(){
       const time = new Date(e.ts).toLocaleString([], {dateStyle:'short', timeStyle:'short'});
       return `<tr>
         <td style="font-size:10.5px; color:var(--ba-warm-grey); white-space:nowrap;">${time}</td>
-        <td>${actionLogLine(e)}</td>
+        <td>${esc(actionLogLine(e))}</td>
         <td><button class="btn danger" data-remove-action="${e.logId}" style="padding:4px 8px; font-size:10px;">Remove</button></td>
       </tr>`;
     }).join('');
@@ -2267,7 +3182,7 @@ async function renderChallengesList(){
     const val = snap.val();
     el.innerHTML = Object.keys(val).map(cid=>{
       const ch = val[cid];
-      return `<div class="track-row"><div class="track-name" style="flex:1;">${ch.title} <span style="color:var(--ba-warm-grey); font-weight:400;">(£${ch.bonus})</span></div><button class="btn danger" data-delete-challenge="${cid}" style="padding:4px 8px; font-size:10px;">Delete</button></div>`;
+      return `<div class="track-row"><div class="track-name" style="flex:1;">${esc(ch.title)} <span style="color:var(--ba-warm-grey); font-weight:400;">(£${ch.bonus})</span></div><button class="btn danger" data-delete-challenge="${cid}" style="padding:4px 8px; font-size:10px;">Delete</button></div>`;
     }).join('');
     el.querySelectorAll('[data-delete-challenge]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
@@ -2296,9 +3211,9 @@ async function renderChallengeSubmissions(){
       Object.keys(chSubs).forEach(teamKey=>{
         const s = chSubs[teamKey];
         if(s.status !== 'submitted') return;
-        rowsHtml += `<div class="track-row"><div class="track-name" style="flex:1;">${ch.title} — <span style="color:var(--ba-warm-grey);">${teamKey}</span> (£${ch.bonus})</div>
-          <button class="btn" data-approve-challenge="${cid}|${teamKey}" style="padding:4px 8px; font-size:10px;">Approve</button>
-          <button class="btn secondary" data-reject-challenge="${cid}|${teamKey}" style="padding:4px 8px; font-size:10px;">Reject</button></div>`;
+        rowsHtml += `<div class="track-row"><div class="track-name" style="flex:1;">${esc(ch.title)} — <span style="color:var(--ba-warm-grey);">${esc(teamKey)}</span> (£${ch.bonus})</div>
+          <button class="btn" data-approve-challenge="${esc(cid+'|'+teamKey)}" style="padding:4px 8px; font-size:10px;">Approve</button>
+          <button class="btn secondary" data-reject-challenge="${esc(cid+'|'+teamKey)}" style="padding:4px 8px; font-size:10px;">Reject</button></div>`;
       });
     });
     el.innerHTML = rowsHtml || '<div class="empty">No pending submissions.</div>';
@@ -2320,11 +3235,18 @@ async function resolveChallengeSubmission(key, approve){
       const teamsData = await listTeams();
       const team = Object.values(teamsData).find(t=>safeKey(t.name)===teamKey);
       if(team && ch){
-        team.cash += ch.bonus;
-        await saveTeam(team);
-        await logActivity('challenge_bonus', team.name, {challengeId: cid, challengeTitle: ch.title, amount: ch.bonus});
+        // Flip submitted → approved first; only the click that wins this pays the bonus.
+        const tx = await subRef.transaction(cur=>{
+          if(cur === null) return null;
+          if(cur.status !== 'submitted') return;
+          return {...cur, status:'approved', approvedAt: Date.now()};
+        });
+        const after = tx.snapshot && tx.snapshot.val();
+        if(tx.committed && after && after.status === 'approved'){
+          await db.ref(teamPath(team.name, 'cash')).set(inc(ch.bonus));
+          await logActivity('challenge_bonus', team.name, {challengeId: cid, challengeTitle: ch.title, amount: ch.bonus});
+        }
       }
-      await subRef.update({status:'approved', approvedAt: Date.now()});
     }catch(e){}
   } else {
     await subRef.update({status:'rejected'});
@@ -2355,10 +3277,11 @@ async function renderTeamChallenges(){
       else if(mySub.status==='submitted') actionHtml = `<span class="owner-tag theirs">Pending review</span>`;
       else if(mySub.status==='approved') actionHtml = `<span class="owner-tag mine">Approved +£${ch.bonus}</span>`;
       else actionHtml = `<span class="owner-tag theirs">Not approved</span>`;
-      return `<div class="stop"><div class="stop-body"><div class="stop-name">${ch.title}</div><div class="stop-meta">${ch.description||''} · £${ch.bonus} bonus</div></div><div class="stop-actions">${actionHtml}</div></div>`;
+      return `<div class="stop"><div class="stop-body"><div class="stop-name">${esc(ch.title)}</div><div class="stop-meta">${ch.description ? esc(ch.description) + ' · ' : ''}£${ch.bonus} bonus</div></div><div class="stop-actions">${actionHtml}</div></div>`;
     }).join('');
     el.querySelectorAll('[data-submit-challenge]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
+        if(isGameLocked()){ toast(lockedMessage()); return; }
         await db.ref(gamePath('/challengeSubmissions/'+btn.dataset.submitChallenge+'/'+myKey)).set({status:'submitted', submittedAt: Date.now()});
         toast('Marked as done — awaiting organiser approval.');
         renderTeamChallenges();
@@ -2375,12 +3298,11 @@ function pathPrefixFor(gameId){
   return (gameId==='live' || gameId==='test') ? gameId : 'games/' + gameId;
 }
 async function getGameName(gameId){
-  if(gameId==='live') return 'Live (existing event)';
-  if(gameId==='test') return 'Test (existing rehearsal)';
+  const fallback = gameId==='live' ? 'Live (existing event)' : gameId==='test' ? 'Test (existing rehearsal)' : gameId;
   try{
-    const snap = await db.ref('games/'+gameId+'/meta/name').once('value');
-    return snap.exists() ? snap.val() : gameId;
-  }catch(e){ return gameId; }
+    const snap = await db.ref(pathPrefixFor(gameId)+'/meta/name').once('value');
+    return snap.exists() ? snap.val() : fallback;
+  }catch(e){ return fallback; }
 }
 async function loadLocationsFor(gameId){
   const snap = await db.ref(pathPrefixFor(gameId)+'/locations').once('value');
@@ -2392,53 +3314,95 @@ function rentForBulk(prop, ownerName, teamsByName, properties){
   if(!ownerName) return prop.type==='station' ? STATION_RENT[1] : Math.round(prop.price/5);
   const owner = teamsByName[ownerName];
   if(!owner) return Math.round(prop.price/5);
+  const owned = ownedIds(owner);
   if(prop.type==='station'){
-    const n = (owner.owned||[]).filter(id=>{ const p = properties.find(pp=>pp.id===id); return p && p.type==='station'; }).length;
+    const n = owned.filter(id=>{ const p = properties.find(pp=>pp.id===id); return p && p.type==='station'; }).length;
     return STATION_RENT[n] || STATION_RENT[4];
   }
   let rent = Math.round(prop.price/5);
   const groupProps = properties.filter(p=>p.group===prop.group);
-  const ownsAll = groupProps.every(p=>(owner.owned||[]).includes(p.id));
+  const ownsAll = groupProps.every(p=>owned.includes(p.id));
   if(ownsAll) rent *= 2;
   return rent;
 }
 async function resetGameById(gameId){
   const prefix = pathPrefixFor(gameId);
-  await db.ref(prefix+'/teams').remove();
-  await db.ref(prefix+'/activity').remove();
-  await db.ref(prefix+'/activeAuction').remove();
-  await db.ref(prefix+'/meetup').remove();
-  await db.ref(prefix+'/challengeSubmissions').remove();
-  await db.ref(prefix+'/config/finalized').set(false);
+  await db.ref(prefix).update({
+    teams: null, activity: null, activeAuction: null, meetup: null, challengeSubmissions: null,
+    positions: null, ownership: null,
+    'config/finalized': false, 'config/finalizeRecord': null,
+    'config/started': false, 'config/startedAt': null
+  });
 }
+// Re-opens a finalised game and reverses the fines that Finalise applied (cash refunded,
+// Fast Track cards given back, the fine log entries removed), so Finalise → Unlock → Finalise
+// charges each team once, not twice.
 async function unlockGameById(gameId){
-  await db.ref(pathPrefixFor(gameId)+'/config/finalized').set(false);
+  const prefix = pathPrefixFor(gameId);
+  const [recSnap, teamsSnap] = await Promise.all([
+    db.ref(prefix+'/config/finalizeRecord').once('value'),
+    db.ref(prefix+'/teams').once('value')
+  ]);
+  const rec = recSnap.val();
+  const teams = teamsSnap.val() || {};
+  const updates = {'config/finalized': false, 'config/finalizeRecord': null};
+  if(rec){
+    Object.keys(rec.teams || {}).forEach(k=>{
+      const r = rec.teams[k];
+      // Follow a rename since finalising: match by key first, then by name.
+      const key = teams[k] ? k : Object.keys(teams).find(tk=>teams[tk] && teams[tk].name === r.name);
+      if(!key) return;
+      if(r.fined) updates['teams/'+key+'/cash'] = inc(r.fined);
+      if(r.immunityUsed) updates['teams/'+key+'/cardFlags/fineImmunity'] = inc(r.immunityUsed);
+    });
+    const actSnap = await db.ref(prefix+'/activity').once('value');
+    const act = actSnap.val() || {};
+    Object.keys(act).forEach(id=>{ if(act[id] && act[id].detail && act[id].detail.finalizeId === rec.id) updates['activity/'+id] = null; });
+  }
+  await db.ref(prefix).update(updates);
+  return {reversed: !!rec};
 }
+// Applies the end-of-event fines once. The transaction on config/finalized is the lock: a second
+// Finalise (or two organisers at once) aborts instead of fining everyone again. What was charged
+// is kept in config/finalizeRecord so Unlock can reverse it exactly.
 async function finalizeGameById(gameId){
   const prefix = pathPrefixFor(gameId);
+  const lock = await db.ref(prefix+'/config/finalized').transaction(cur=>cur ? undefined : true);
+  if(!lock.committed) return {already:true};
+  const finalizeId = 'fin_' + Date.now();
   const properties = await loadLocationsFor(gameId);
   const teamsSnap = await db.ref(prefix+'/teams').once('value');
-  if(!teamsSnap.exists()) return;
   const teamsByName = {};
-  Object.values(teamsSnap.val()).forEach(t=>{ teamsByName[t.name] = t; });
+  const keyByName = {};
+  Object.entries(teamsSnap.val() || {}).forEach(([k,t])=>{ if(t && t.name){ teamsByName[t.name] = t; keyByName[t.name] = k; } });
   const owners = {};
-  Object.values(teamsByName).forEach(t=>(t.owned||[]).forEach(id=>{ owners[id] = t.name; }));
+  Object.values(teamsByName).forEach(t=>ownedIds(t).forEach(id=>{ owners[id] = t.name; }));
+  const record = {id: finalizeId, ts: Date.now(), teams: {}};
+  const updates = {};
+  const ts = Date.now();
   for(const t of Object.values(teamsByName)){
-    t.visited = t.visited || {};
-    const unvisited = properties.filter(p=>!t.visited[p.id]);
-    const fines = unvisited.map(p=>({p, fine: Math.round(1.5*rentForBulk(p, owners[p.id], teamsByName, properties))}));
-    fines.sort((a,b)=>b.fine-a.fine);
-    t.cardFlags = t.cardFlags || {};
-    let immunity = t.cardFlags.fineImmunity || 0;
+    const k = keyByName[t.name];
+    const visited = t.visited || {};
+    const fines = properties.filter(p=>!visited[p.id])
+      .map(p=>({p, fine: Math.round(1.5*rentForBulk(p, owners[p.id], teamsByName, properties))}))
+      .sort((a,b)=>b.fine-a.fine);
+    let immunity = (t.cardFlags && t.cardFlags.fineImmunity) || 0;
+    let total = 0, immunityUsed = 0;
     for(const f of fines){
-      if(immunity > 0){ immunity -= 1; continue; }
-      t.cash -= f.fine;
-      await db.ref(prefix+'/activity').push({type:'finalize_fine', team:t.name, detail:{propertyId:f.p.id, propertyName:f.p.name, amount:f.fine}, ts:Date.now()});
+      if(immunity > 0){ immunity -= 1; immunityUsed += 1; continue; }
+      total += f.fine;
+      updates['activity/'+db.ref(prefix+'/activity').push().key] = {type:'finalize_fine', team:t.name, detail:{propertyId:f.p.id, propertyName:f.p.name, amount:f.fine, finalizeId}, ts};
     }
-    t.cardFlags.fineImmunity = immunity;
-    await db.ref(prefix+'/teams/'+safeKey(t.name)).set(t);
+    if(immunityUsed){
+      updates['teams/'+k+'/cardFlags/fineImmunity'] = inc(-immunityUsed);
+      updates['activity/'+db.ref(prefix+'/activity').push().key] = {type:'fine_immunity_used', team:t.name, detail:{count:immunityUsed, finalizeId}, ts};
+    }
+    if(total) updates['teams/'+k+'/cash'] = inc(-total);
+    record.teams[k] = {name:t.name, fined:total, immunityUsed};
   }
-  await db.ref(prefix+'/config/finalized').set(true);
+  updates['config/finalizeRecord'] = record;
+  await db.ref(prefix).update(updates);
+  return {ok:true};
 }
 async function loadCombinedLeaderboard(gameIds){
   const allTeams = [];
@@ -2451,7 +3415,8 @@ async function loadCombinedLeaderboard(gameIds){
     ]);
     if(!teamsSnap.exists()) continue;
     Object.values(teamsSnap.val()).forEach(t=>{
-      const portfolioValue = (t.owned||[]).reduce((sum,id)=>{ const p=properties.find(pp=>pp.id===id); return sum+(p?p.price:0); },0);
+      if(!t || !t.name) return;
+      const portfolioValue = ownedIds(t).reduce((sum,id)=>{ const p=properties.find(pp=>pp.id===id); return sum+(p?p.price:0); },0);
       allTeams.push({...t, gameId, gameName, netWorth:(t.cash||0)+portfolioValue});
     });
   }
@@ -2505,8 +3470,8 @@ async function renderGroupsList(){
     const rows = Object.keys(val).map(id=>{
       const meta = val[id].meta || {};
       const memberCount = val[id].games ? Object.keys(val[id].games).length : 0;
-      return `<div class="track-row"><div class="track-name" style="flex:1;">${meta.name||id} <span style="color:var(--ba-warm-grey); font-weight:400;">(${memberCount} game${memberCount===1?'':'s'})</span></div>
-        <button class="btn secondary" data-manage-group="${id}" data-group-name="${meta.name||id}" style="padding:4px 8px; font-size:10.5px;">Manage</button>
+      return `<div class="track-row"><div class="track-name" style="flex:1;">${esc(meta.name||id)} <span style="color:var(--ba-warm-grey); font-weight:400;">(${memberCount} game${memberCount===1?'':'s'})</span></div>
+        <button class="btn secondary" data-manage-group="${id}" data-group-name="${esc(meta.name||id)}" style="padding:4px 8px; font-size:10.5px;">Manage</button>
         <button class="btn danger" data-delete-group="${id}" style="padding:4px 8px; font-size:10.5px;">Delete</button></div>`;
     }).join('');
     el.innerHTML = rows;
@@ -2562,7 +3527,7 @@ async function renderGroupMembers(){
   const rows = [];
   for(const gid of gameIds){
     const name = await getGameName(gid);
-    rows.push(`<div class="track-row"><div class="track-name" style="flex:1;">${name}</div><button class="btn danger" data-remove-group-game="${gid}" style="padding:4px 8px; font-size:10px;">Remove</button></div>`);
+    rows.push(`<div class="track-row"><div class="track-name" style="flex:1;">${esc(name)}</div><button class="btn danger" data-remove-group-game="${gid}" style="padding:4px 8px; font-size:10px;">Remove</button></div>`);
   }
   el.innerHTML = rows.join('');
   el.querySelectorAll('[data-remove-group-game]').forEach(btn=>{
@@ -2584,9 +3549,9 @@ async function renderGroupCombinedLeaderboard(){
   if(teams.length === 0){ el.innerHTML = '<div class="empty">No teams registered in any member game yet.</div>'; return; }
   const rows = teams.map((t,i)=>`<tr>
     <td class="ba-rank-cell ${i===0?'gold':''}">${i+1}</td>
-    <td><strong>${t.icon?t.icon+' ':''}${t.name}</strong></td>
-    <td style="font-size:10.5px; color:var(--ba-warm-grey);">${t.gameName}</td>
-    <td style="font-weight:800; color:var(--ba-blue-corp);">£${t.netWorth}</td>
+    <td><strong>${esc(t.icon?t.icon+' ':'')}${esc(t.name)}</strong></td>
+    <td style="font-size:10.5px; color:var(--ba-warm-grey);">${esc(t.gameName)}</td>
+    <td style="font-weight:800; color:var(--ba-blue-corp);">${moneyHtml(t.netWorth)}</td>
   </tr>`).join('');
   el.innerHTML = `<div class="scroll-x"><table class="ba-table"><thead><tr><th></th><th>Team</th><th>Game</th><th>Net worth</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -2595,8 +3560,16 @@ document.getElementById('group-unlock-all-btn').addEventListener('click', async 
   const statusEl = document.getElementById('group-bulk-status');
   const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
   const gameIds = snap.exists() ? Object.keys(snap.val()) : [];
-  for(const gid of gameIds){ await unlockGameById(gid); }
-  statusEl.textContent = 'All games in this group re-opened.';
+  for(const gid of gameIds){
+    await unlockGameById(gid);
+    const prefix = pathPrefixFor(gid);
+    const cfg = (await db.ref(prefix+'/config').once('value')).val() || {};
+    if(!cfg.started){
+      await db.ref(prefix+'/config').update({started: true, startedAt: cfg.startedAt || Date.now()});
+      await db.ref(prefix+'/activity').push({type: cfg.startedAt ? 'game_resumed' : 'game_started', team: '', detail: {}, ts: Date.now()});
+    }
+  }
+  statusEl.textContent = 'All games in this group started (any finalised ones re-opened and their fines refunded).';
   statusEl.className = 'status-line good';
 });
 document.getElementById('group-reset-all-btn').addEventListener('click', async ()=>{
@@ -2620,8 +3593,9 @@ document.getElementById('group-finalize-all-btn').addEventListener('click', asyn
   statusEl.className = 'status-line warn';
   const snap = await db.ref('groups/'+currentGroupId+'/games').once('value');
   const gameIds = snap.exists() ? Object.keys(snap.val()) : [];
-  for(const gid of gameIds){ await finalizeGameById(gid); }
-  statusEl.textContent = 'All games in this group finalised.';
+  let skipped = 0;
+  for(const gid of gameIds){ const r = await finalizeGameById(gid); if(r.already) skipped++; }
+  statusEl.textContent = 'All games in this group finalised.' + (skipped ? ` ${skipped} were already finalised and were not fined again.` : '');
   statusEl.className = 'status-line good';
   renderGroupCombinedLeaderboard();
 });
@@ -2645,6 +3619,6 @@ async function bootstrap(){
 }
 bootstrap();
 
-// periodic refresh while on play tab
-setInterval(()=>{ if(currentRole==='team' && currentTeam) renderStops(); }, 20000);
+// Distances and the event clock drift even without GPS or data changes, so refresh occasionally.
+setInterval(()=>{ if(currentRole==='team' && currentTeam) scheduleTeamRender(); }, 20000);
 setInterval(()=>{ if(currentRole==='admin' && document.getElementById('view-admin').classList.contains('active')) renderTracking(); }, 15000);

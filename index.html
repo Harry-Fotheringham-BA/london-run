@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>The London Run</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -34,7 +34,7 @@
       <label class="field-label">Control centre passcode</label>
       <input type="password" id="cc-pass-input" placeholder="Passcode">
       <div class="btn-row"><button class="btn" id="cc-unlock-btn">Unlock</button></div>
-      <div class="status-line" id="cc-gate-status">Default passcode is LONDONHQ unless changed below.</div>
+      <div class="status-line" id="cc-gate-status"></div>
     </div>
 
     <div id="cc-panel" style="display:none;">
@@ -118,13 +118,19 @@
 
 <!-- ============ ROLE GATE ============ -->
 <div class="wrap" id="role-gate" style="display:none;">
-  <header class="top">
-    <div class="eyebrow">Company Away Day · Live Event</div>
-    <h1>The London <span class="accent">Run</span></h1>
-    <div class="subtitle" id="gate-game-subtitle">Five teams. Twenty-six real London properties. Sign in below to get started.</div>
+  <header class="topnav">
+    <div class="topnav-left">
+      <div class="topnav-word">The London Run</div>
+      <div class="topnav-sub">Company Away Day · Live Event</div>
+    </div>
+    <div class="topnav-right">
+      <span class="live-dot" title="Live data"></span>
+      <span class="topnav-badge" style="background:var(--ba-blue-corp);">SIGN IN</span>
+    </div>
   </header>
 
   <div style="padding:18px 20px;">
+    <div class="status-line" id="gate-game-subtitle" style="margin-bottom:12px; font-size:12px;">Five teams. Twenty-six real London properties. Sign in below to get started.</div>
     <div class="card" id="role-choice-card">
       <h2>Who's this for?</h2>
       <div class="role-btn-row">
@@ -155,7 +161,7 @@
         <button class="btn" id="gate-admin-enter-btn">Enter</button>
         <button class="btn secondary" id="gate-admin-back-btn">Back</button>
       </div>
-      <div class="status-line" id="gate-admin-status">Default passcode is LONDON26 unless changed.</div>
+      <div class="status-line" id="gate-admin-status"></div>
     </div>
   </div>
 </div>
@@ -172,19 +178,20 @@
     <button data-view="board">Board</button>
     <button data-view="leaderboard">Leaders</button>
     <button data-view="admin">Admin</button>
+    <button data-view="help">Help</button>
   </nav>
   <div class="topnav-right">
     <span class="live-dot" title="Live data"></span>
     <span id="env-badge" class="topnav-badge" style="display:none;">TEST</span>
     <button class="topnav-icon-btn" id="all-games-btn" title="All games">&#8962;</button>
     <button class="topnav-icon-btn" id="switch-role-btn" title="Switch role">&#8646;</button>
-    <button class="topnav-burger" id="topnav-burger" title="Menu">&#9776;</button>
   </div>
 </header>
 <div class="wrap">
 
   <!-- PLAY VIEW -->
   <section class="view" id="view-play">
+    <div class="lock-banner" id="lock-banner" style="display:none;"></div>
     <div class="card auction-card" id="auction-card" style="display:none;">
       <h2>🔨 Property Auction</h2>
       <div id="auction-body"></div>
@@ -193,9 +200,14 @@
       <h2>🍽️ Halfway Meetup</h2>
       <div id="meetup-body"></div>
     </div>
+    <div class="card here-card" id="here-card" style="display:none;">
+      <h2>📍 You're here</h2>
+      <div id="here-body" class="group-grid"></div>
+    </div>
     <div class="play-top-row">
       <div class="card" id="wallet-card">
-        <h2>Wallet</h2>
+        <h2>Wallet · <span id="wallet-team-name" class="wallet-team-name"></span></h2>
+        <div class="event-clock" id="event-clock" style="display:none;"></div>
         <div class="stat-grid-2">
           <div class="ba-stat-card">
             <div class="ba-stat-label">Cash</div>
@@ -206,6 +218,7 @@
             <div class="ba-stat-value" id="portfolio-display">0</div>
           </div>
         </div>
+        <div class="status-line warn" id="negative-note" style="display:none;">You're below £0. You can keep playing, but you can't buy or bid until you're back above the price. Collect rent and draw cards to recover.</div>
         <div class="status-line" id="visited-progress-label">0 / 26 visited</div>
         <div class="ba-progress"><div class="ba-progress-fill on-plan" id="visited-progress-fill" style="width:0%;"></div></div>
         <div class="status-line" id="cards-display"></div>
@@ -216,7 +229,7 @@
       </div>
 
       <div class="compass-widget" id="compass-widget">
-        <div class="compass-dial"><div class="compass-n">N</div><div class="compass-arrow" id="compass-arrow"></div></div>
+        <div class="compass-dial"><div class="compass-rose" id="compass-rose"><div class="compass-n">N</div></div><div class="compass-arrow" id="compass-arrow"></div></div>
         <div class="compass-info">
           <div class="cn" id="compass-target">—</div>
           <div class="cd" id="compass-dist">—</div>
@@ -226,6 +239,7 @@
       <div class="card" id="gps-card">
         <h2>Location</h2>
         <div class="status-line" id="gps-status">Requesting location…</div>
+        <div class="small-note">Keep this screen on and the app open while you walk — phones (especially iPhones) stop sharing location when the screen locks.</div>
       </div>
     </div>
 
@@ -243,12 +257,14 @@
       <h2>Your map</h2>
       <div id="player-map"></div>
       <div class="btn-row">
-        <button class="btn secondary" id="open-google-maps-btn">Open nearest in Google Maps</button>
-        <button class="btn secondary" id="open-apple-maps-btn">Open nearest in Apple Maps</button>
+        <button class="btn secondary" id="centre-me-btn">Centre on me</button>
+        <button class="btn secondary" id="open-google-maps-btn">Next stop in Google Maps</button>
+        <button class="btn secondary" id="open-apple-maps-btn">Next stop in Apple Maps</button>
       </div>
     </div>
 
     <div id="special-stops"></div>
+    <div class="group-header properties-header"><span class="group-title">Properties</span></div>
     <div class="sort-row">
       <button data-sort="group" class="active">Sort: groups</button>
       <button data-sort="distance">Sort: nearest first</button>
@@ -259,17 +275,31 @@
   <!-- BOARD VIEW -->
   <section class="view" id="view-board">
     <div class="card"><h2>Ownership overview</h2><div class="status-line">Who owns what, and the current rent.</div></div>
-    <div id="board-overview"></div>
+    <div class="sort-row">
+      <button data-board-mode="ring" class="active">Board</button>
+      <button data-board-mode="list">List</button>
+    </div>
+    <div id="board-ring-wrap">
+      <div id="board-ring" class="ring-wrap"></div>
+      <div id="ring-detail" class="ring-detail"></div>
+    </div>
+    <div id="board-overview" style="display:none;"></div>
     <div class="card"><h2>Activity log</h2><div id="board-activity-list"></div></div>
   </section>
 
   <!-- LEADERBOARD VIEW -->
   <section class="view" id="view-leaderboard">
     <div id="podium-section" style="display:none;"></div>
-    <div class="card"><h2>Live standings</h2><div class="status-line">Net worth = cash + value of owned properties.</div></div>
+    <div class="card"><h2>Live standings</h2><div class="status-line">Net worth = cash + value of owned properties. Cash can go below £0, and a negative net worth ranks below every positive one.</div></div>
     <div id="leaderboard-list"></div>
-    <div class="btn-row"><button class="btn secondary" id="lb-refresh-btn">Refresh</button></div>
+    <div class="btn-row"><button class="btn secondary" id="lb-refresh-btn">Refresh</button><button class="btn" id="lb-bigscreen-btn">Big screen</button></div>
+    <div class="card" id="lb-map-card" style="display:none; margin-top:12px;"><h2>Where teams are</h2><div id="lb-map"></div></div>
     <div class="card"><h2>Live activity</h2><div id="public-activity-list"></div></div>
+  </section>
+
+  <!-- HELP VIEW: guides built by guide.js with this game's own numbers -->
+  <section class="view" id="view-help">
+    <div id="help-content"></div>
   </section>
 
   <!-- ADMIN VIEW -->
@@ -306,6 +336,8 @@
           <label class="field-label">Select team</label>
           <select id="manage-team-select"><option value="">— choose team —</option></select>
           <div id="manage-team-fields" style="display:none;">
+            <label class="field-label">Team name</label>
+            <input type="text" id="edit-team-name">
             <label class="field-label">Team icon</label>
             <select id="edit-team-icon"></select>
             <label class="field-label">Team PIN</label>
@@ -338,29 +370,70 @@
 
         <div class="card full-width">
           <h2>Live tracking (safety)</h2>
-          <div class="status-line">Positions update automatically from each team's phone. See them live as pins on the Locations map in Game Setup — refreshes every 15s while this tab is open.</div>
+          <div class="status-line">Positions update automatically from each team's phone. See them live on the map in Play control — refreshes every 15s while the Admin tab is open.</div>
           <div id="tracking-list" style="margin-top:10px;"></div>
           <div class="btn-row"><button class="btn secondary" id="tracking-refresh-btn">Refresh</button></div>
         </div>
       </div>
 
       <div class="admin-subpanel" data-admin-panel="play" style="display:none;">
+        <div class="card full-width game-status-card">
+          <h2>Game status</h2>
+          <div class="game-status" id="game-status-line">—</div>
+          <div class="btn-row">
+            <button class="btn" id="game-start-btn">Start game</button>
+            <button class="btn danger" id="game-pause-btn" style="display:none;">Pause game</button>
+          </div>
+          <div class="small-note">Teams can sign in and look around before the start, but can't buy, pay rent, draw cards, bid or mark challenges done until you press Start.</div>
+        </div>
+
+        <div class="card full-width">
+          <h2>Big screen</h2>
+          <div class="status-line">A full-screen view for a projector or TV: the board, live standings and the latest moves, updating by themselves. Open this link on the screen's computer — no sign-in needed.</div>
+          <div class="team-link-row track-row" style="margin-top:8px;">
+            <input type="text" readonly id="bigscreen-link" class="team-link-input" onclick="this.select()">
+            <div class="team-link-btns">
+              <button class="btn secondary" id="bigscreen-copy-btn">Copy</button>
+              <a class="btn secondary" id="bigscreen-open-link" target="_blank" style="text-decoration:none;">Open</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="card full-width">
+          <h2>Live team map</h2>
+          <div class="status-line">Where every team's phone last reported from. Grey pins haven't pinged for 5+ minutes. Keep this screen open during the game — it also closes auctions and applies meetup fines for teams whose app isn't open.</div>
+          <div id="admin-live-map" style="margin-top:10px;"></div>
+        </div>
+
         <div class="card">
           <h2>Event settings</h2>
+          <label class="field-label">Game name</label>
+          <input type="text" id="cfg-game-name" placeholder="e.g. Flying Start — London Run">
           <label class="field-label">Starting money per team (£)</label>
           <input type="number" id="cfg-startmoney">
           <label class="field-label">Check-in radius (metres)</label>
           <input type="number" id="cfg-radius">
+          <div class="small-note">50–75m suits central London — several Monopoly stops are under 250m apart. Phones whose GPS accuracy is worse than this radius can't check in.</div>
           <label class="field-label">Event end time</label>
           <input type="datetime-local" id="cfg-end">
+          <div class="small-note">Teams see a countdown, and the board locks automatically at this time. Fines are still applied when you press Finalise.</div>
           <label class="field-label">Organiser passcode</label>
           <input type="text" id="cfg-passcode">
-          <label class="field-label">Starting location (lat, lng)</label>
-          <div style="display:flex; gap:8px;">
-            <input type="number" step="0.00001" id="cfg-start-lat" style="flex:1;">
-            <input type="number" step="0.00001" id="cfg-start-lng" style="flex:1;">
-          </div>
-          <div class="btn-row"><button class="btn secondary" id="cfg-start-locate-btn">Use my location</button></div>
+          <label class="field-label">Other teams' locations</label>
+          <label class="check-row"><input type="checkbox" id="cfg-show-locations"> Teams and spectators can see where every team is</label>
+          <div class="small-note">When on, team maps show the other teams, and Leaders shows a "Last seen" column and a map. When off, only you can see locations.</div>
+          <label class="field-label">How teams get Chance cards</label>
+          <select id="cfg-card-mode">
+            <option value="location">At Chance &amp; Community Chest locations (one free draw each)</option>
+            <option value="buy">Bought from the app, any time, for a price</option>
+            <option value="both">Both</option>
+          </select>
+          <label class="field-label">Card price (£)</label>
+          <input type="number" id="cfg-card-price" min="0" value="50">
+          <div class="small-note">Bought cards come from the same deck as location draws. Teams can buy as many as they like while the game is running, if they have the cash.</div>
+          <label class="field-label">Organiser contact (shown in players' Help)</label>
+          <input type="text" id="cfg-contact" placeholder="e.g. Harry — 07700 900123">
+          <div class="small-note">The starting location and lunch spot are set on the Locations map in Game setup.</div>
           <div class="btn-row"><button class="btn" id="cfg-save-btn">Save settings</button></div>
           <div class="status-line" id="cfg-status"></div>
           <div class="status-line" id="game-identity-note" style="margin-top:14px; padding-top:10px; border-top:1px solid var(--grey1);">This game's data is fully separate from every other game. Want a rehearsal? Create a new game from the Control Centre instead of testing inside this one.</div>
@@ -368,7 +441,7 @@
 
         <div class="card">
           <h2>Finalise event</h2>
-          <div class="status-line">Applies the 1.5× rent fine to every team for any unvisited property, then locks the board.</div>
+          <div class="status-line">Applies the 1.5× rent fine to every team for any unvisited property, then locks the board. It can only run once — Re-open board refunds those fines, so you can safely finalise again later.</div>
           <div class="btn-row">
             <button class="btn danger" id="finalize-btn">Finalise &amp; apply fines</button>
             <button class="btn secondary" id="unlock-board-btn">Re-open board</button>
@@ -385,20 +458,19 @@
 
         <div class="card full-width">
           <h2>Halfway meetup challenge</h2>
-          <div class="status-line">Set a meetup point and deadline. Any team whose GPS isn't within range by the deadline starts accruing a fine automatically, every 5 minutes, until they arrive.</div>
-          <label class="field-label">Meetup point (lat, lng)</label>
-          <div style="display:flex; gap:8px;">
-            <input type="number" step="0.00001" id="meetup-lat" style="flex:1;">
-            <input type="number" step="0.00001" id="meetup-lng" style="flex:1;">
-          </div>
-          <div class="btn-row"><button class="btn secondary" id="meetup-locate-btn">Use my location</button></div>
+          <div class="status-line">Plan the lunch meetup ahead of time, then start it on the day. Any team whose GPS isn't within range by the deadline starts accruing a fine automatically, every 5 minutes, until they arrive. Once a team has checked in they're never fined again, even after they walk on.</div>
+          <label class="field-label">Lunch spot</label>
+          <div class="status-line" id="meetup-point-summary">Not set yet — place the lunch pin on the Locations map in Game setup.</div>
           <label class="field-label">Deadline</label>
           <input type="datetime-local" id="meetup-deadline">
           <label class="field-label">Fine per 5 minutes late (£)</label>
           <input type="number" id="meetup-fine" value="50">
           <label class="field-label">Arrival radius (metres)</label>
           <input type="number" id="meetup-radius" value="150">
+          <label class="field-label">Stop fining after (minutes past the deadline)</label>
+          <input type="number" id="meetup-stop-after" value="60">
           <div class="btn-row">
+            <button class="btn secondary" id="meetup-save-btn">Save plan</button>
             <button class="btn" id="meetup-start-btn">Start challenge</button>
             <button class="btn secondary" id="meetup-cancel-btn">Cancel challenge</button>
           </div>
@@ -415,7 +487,12 @@
       <div class="admin-subpanel" data-admin-panel="setup" style="display:none;">
         <div class="card full-width">
           <h2>Locations map</h2>
-          <div class="status-line">Drag a pin to correct its spot, or select one and type exact coordinates. Changes apply instantly everywhere — check-ins, compass, board.</div>
+          <div class="status-line">Drag a pin to correct its spot, or select one and type exact coordinates. Changes apply instantly everywhere — check-ins, compass, board. The START and LUNCH pins can be dragged too, or use the buttons below and click the map to drop them.</div>
+          <div class="btn-row">
+            <button class="btn secondary" id="place-start-btn">📍 Place start on map</button>
+            <button class="btn secondary" id="place-lunch-btn">🍽️ Place lunch spot on map</button>
+          </div>
+          <div class="status-line" id="special-points-status"></div>
           <div id="leaflet-map" style="margin-top:10px;"></div>
           <div class="btn-row">
             <button class="btn secondary" id="loc-locate-btn">Show my location on map</button>
@@ -492,6 +569,22 @@
 
   <footer class="foot"><p>SHARED LIVE DATA · INTERNAL TEAM EVENT · NOT FOR EXTERNAL DISTRIBUTION</p></footer>
 </div>
+</div>
+
+<!-- ============ BIG SCREEN (projector view, built by board.js) ============ -->
+<div id="big-screen" class="big-screen" style="display:none;">
+  <header class="bs-head">
+    <div class="bs-brand">THE LONDON RUN <span id="bs-game"></span></div>
+    <div class="bs-status" id="bs-status"></div>
+    <button class="bs-exit" id="bs-exit-btn" title="Exit big screen">Exit</button>
+  </header>
+  <div class="bs-board ring-wrap" id="bs-board"></div>
+  <aside class="bs-side">
+    <div class="bs-auction" id="bs-auction" style="display:none;"></div>
+    <div class="bs-heading">Standings · net worth</div>
+    <div id="bs-standings"></div>
+  </aside>
+  <footer class="bs-ticker" id="bs-ticker"></footer>
 </div>
 
 <!-- ============ SHARED LOCATION EDITOR (templates + per-game boards) ============ -->
@@ -589,5 +682,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-database-compat.js"></script>
 <script src="app.js"></script>
+<script src="guide.js"></script>
+<script src="board.js"></script>
 </body>
 </html>
